@@ -51,6 +51,11 @@ export interface OperatorManualActionSnapshot {
   timestamp: string;
 }
 
+export interface SpokenPhraseSnapshot {
+  phrase: string;
+  timestamp: string;
+}
+
 export interface BroadcastContextState {
   phase: BroadcastPhase;
   broadcastStartedAt: string;
@@ -120,6 +125,11 @@ export interface BroadcastContextState {
     voiceActive: boolean;
     audioClassification: "speech" | "music" | "silence";
     tallyConnected: boolean;
+  };
+  captions: {
+    voiceActive: boolean;
+    lastTranscript: string | null;
+    recentPhrases: SpokenPhraseSnapshot[];
   };
 }
 
@@ -285,6 +295,11 @@ export class ComposerState {
       voiceActive: true,
       audioClassification: "silence",
       tallyConnected: true,
+    },
+    captions: {
+      voiceActive: true,
+      lastTranscript: null,
+      recentPhrases: [],
     },
   };
 
@@ -766,7 +781,10 @@ export class ComposerState {
     if (data.camerasConnected !== undefined) {
       this.context.hardware.camerasConnected = data.camerasConnected;
     }
-    if (data.voiceActive !== undefined) this.context.hardware.voiceActive = data.voiceActive;
+    if (data.voiceActive !== undefined) {
+      this.context.hardware.voiceActive = data.voiceActive;
+      this.context.captions.voiceActive = data.voiceActive;
+    }
     if (data.audioClassification !== undefined) {
       this.context.hardware.audioClassification = data.audioClassification;
     }
@@ -782,5 +800,28 @@ export class ComposerState {
     if (data.cameraMotionSpeed !== undefined) {
       this.timeSeriesStore.record("camera_motion_speed", data.cameraMotionSpeed);
     }
+  }
+
+  ingestTranscript(text: string, timestamp?: string): void {
+    const ts = timestamp ?? new Date().toISOString();
+    this.context.captions.lastTranscript = text;
+    this.context.captions.voiceActive = true;
+    this.context.hardware.voiceActive = true;
+
+    const normalized = text.toLowerCase().trim();
+    if (normalized) {
+      this.context.captions.recentPhrases.push({
+        phrase: normalized,
+        timestamp: ts,
+      });
+      if (this.context.captions.recentPhrases.length > 50) {
+        this.context.captions.recentPhrases.shift();
+      }
+    }
+
+    this.eventBroker?.emit({
+      type: "transcript-received",
+      data: { text, timestamp: ts },
+    });
   }
 }

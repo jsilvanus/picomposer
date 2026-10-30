@@ -4,6 +4,7 @@ import {
   StandingUiRuleCreateSchema,
   UiScreenSpecSchema,
   type MouseSelectionContext,
+  type RundownActionItem,
   type SavedUiComponent,
   type StandingUiRule,
   type TimeSeriesMetric,
@@ -68,7 +69,11 @@ export function parseVisibilityConditionFromPrompt(promptText: string): UiVisibi
       section: section ?? "sermon",
     };
   }
-  if (/\b(?:only\s+)?during\s+(?:the\s+)?(?:sermon|saarna|communion|prayer|intro)\b/i.test(promptText)) {
+  if (
+    /\b(?:only\s+)?during\s+(?:the\s+)?(?:sermon|saarna|communion|prayer|intro)\b/i.test(promptText) ||
+    /\bwhile\s+(?:the\s+)?(?:sermon|saarna|communion|prayer|intro)\b/i.test(promptText) ||
+    /\b(?:while|during)\b.*\b(?:sermon|saarna|communion|prayer|intro)\b.*\b(?:going on|active|live)\b/i.test(promptText)
+  ) {
     return {
       operator: "during",
       section: section ?? "sermon",
@@ -91,6 +96,116 @@ export function parseTimedVisibilitySec(promptText: string): { showForSec?: numb
     showForSec: sec,
     expiresAt: new Date(Date.now() + sec * 1000).toISOString(),
   };
+}
+
+/**
+ * Detects if a prompt is an imperative live broadcast execution command (e.g. "cut to cam 1")
+ * rather than a UI-authoring instruction. The UI agent does NOT execute broadcast actions directly.
+ */
+export function isDirectBroadcastCommand(promptText: string): boolean {
+  const t = promptText.trim().toLowerCase();
+  const hasUiIntent =
+    /\b(add|create|show|mount|button|panel|card|widget|strip|controls?|macro|cue|timer|chart|view|layout|save|preset\s*card|toolbar)\b/i.test(
+      t
+    );
+  if (hasUiIntent) return false;
+
+  return (
+    /^(?:cut|switch|take)\s+(?:to\s+)?(?:cam(?:era)?\s*\d+|input\s*\d+|pgm|pvw)\b/i.test(t) ||
+    /^(?:fade\s+to\s+black|ftb)\b/i.test(t) ||
+    /^(?:mute|unmute)\s+(?:all|audio|mics?|sanctuary)\b/i.test(t) ||
+    /^(?:start|stop)\s+(?:stream|broadcast|recording)\b/i.test(t) ||
+    /^(?:privacy\s+blur|blur\s+cam(?:era)?)\b/i.test(t)
+  );
+}
+
+/**
+ * Extracts action targets (cameras, presets with cutAfterMoved, ATEM, DSK graphics, audio)
+ * from natural language UI requests (e.g. "cam1 preset 4, cut after moved", "graveyard graphic on dsk").
+ */
+export function parseActionTargetsFromPrompt(promptText: string): { label: string; targets: RundownActionItem[] } | null {
+  const targets: RundownActionItem[] = [];
+
+  // cam preset: e.g. "cam1 preset 4, cut after moved", "camera 2 preset pulpit"
+  const camPreset = /\bcam(?:era)?\s*(\d+)\s+preset\s*(\d+|[a-zA-Z0-9_-]+)/i.exec(promptText);
+  if (camPreset) {
+    const camId = Number.parseInt(camPreset[1]!, 10);
+    const rawPreset = camPreset[2]!;
+    const preset = Number.isNaN(Number(rawPreset)) ? rawPreset : Number(rawPreset);
+    const cutAfterMoved = /\bcut\s+after\s+moved\b/i.test(promptText);
+    targets.push({
+      cam: {
+        id: camId,
+        preset,
+        ...(cutAfterMoved ? { cutAfterMoved: true } : {}),
+      },
+    });
+  }
+
+  // privacy blur: e.g. "privacy blur on camera 1", "privacy blur cam 2"
+  const privacyMatch = /\bprivacy\s+blur\s+(?:on\s+)?cam(?:era)?\s*(\d+)\b/i.exec(promptText);
+  if (privacyMatch) {
+    const camId = Number.parseInt(privacyMatch[1]!, 10);
+    targets.push({
+      cam: {
+        id: camId,
+        privacyBlur: true,
+      },
+    });
+  }
+
+  // graphic on dsk: e.g. "graveyard graphic on dsk", "put cross graphic on dsk"
+  const dskMatch = /(?:put\s+)?([a-zA-Z0-9_-]+)\s+graphic\s+(?:on\s+)?dsk\b/i.exec(promptText);
+  if (dskMatch) {
+    const graphic = dskMatch[1]!;
+    targets.push({
+      dsk: {
+        id: 1,
+        graphic,
+        onAir: true,
+      },
+    });
+  }
+
+  // atem cut / switch: e.g. "cut to cam 2", "cut to input 3"
+  const cutMatch = /\bcut\s+(?:to\s+)?(?:cam(?:era)?|input)\s*(\d+)\b/i.exec(promptText);
+  if (cutMatch && !camPreset) {
+    const input = Number.parseInt(cutMatch[1]!, 10);
+    targets.push({
+      atem: {
+        cut: input,
+      },
+    });
+  }
+
+  // mute audio: e.g. "mute mic 2", "mute all mics"
+  const muteMatch = /\bmute\s+(?:mic\s*(\d+)|all\s+mics?|sanctuary)\b/i.exec(promptText);
+  if (muteMatch) {
+    const ch = muteMatch[1] ? Number.parseInt(muteMatch[1], 10) : undefined;
+    if (ch) {
+      targets.push({ audio: { channel: ch, mute: true } });
+    } else {
+      targets.push({ audio: { muteAll: true } });
+    }
+  }
+
+  if (targets.length === 0) return null;
+
+  let label = "Dispatch Action";
+  if (camPreset) {
+    const cut = /\bcut\s+after\s+moved\b/i.test(promptText) ? " (Cut after moved)" : "";
+    label = `Cam ${camPreset[1]} Preset ${camPreset[2]}${cut}`;
+  } else if (privacyMatch) {
+    label = `Privacy Blur Cam ${privacyMatch[1]}`;
+  } else if (dskMatch) {
+    label = `${dskMatch[1]} Graphic on DSK`;
+  } else if (cutMatch) {
+    label = `Cut to Cam ${cutMatch[1]}`;
+  } else if (muteMatch) {
+    label = muteMatch[1] ? `Mute Mic ${muteMatch[1]}` : "Mute Sanctuary Mics";
+  }
+
+  return { label, targets };
 }
 
 /**
@@ -279,6 +394,332 @@ export class PromptedUiCreatorAgent {
     const lower = promptText.toLowerCase();
     const condition = parseVisibilityConditionFromPrompt(promptText);
     const timed = parseTimedVisibilitySec(promptText);
+
+    // 0A. Direct Broadcast Execution Guard
+    // The UI Creator agent NEVER executes live broadcast commands directly.
+    if (isDirectBroadcastCommand(promptText)) {
+      const spec = this.ensureTargetSpec(targetScreenId);
+      return {
+        ok: true,
+        agentId: "prompted-creator-agent",
+        intent: "screen_layout",
+        source: "deterministic-compiler",
+        targetScreenId: spec.screenId,
+        summary:
+          "The UI agent designs and manages UI layouts, components, and UI cues, but does not execute live broadcast commands directly. To execute broadcast actions, either add an action button to your UI (e.g. 'add button to cut to cam 1') or summon an operational agent (e.g. 'summon agent chat') to control the broadcast via conversational chat.",
+        screen: spec,
+        contextUsed,
+      };
+    }
+
+    // 0B. Summon Operational Agent Chat Prompt Bar: e.g. "summon agent", "add chat prompt bar", "summon copilot"
+    if (
+      /\b(?:summon|add|bring|mount|open)\s+(?:an?\s+)?(?:agent|chat|copilot|operator)(?:\s+(?:prompt|bar|widget|controls?))?\b/i.test(
+        promptText
+      ) ||
+      /\b(?:agent\s+chat|chat\s+prompt\s+bar)\b/i.test(promptText)
+    ) {
+      const spec = this.ensureTargetSpec(targetScreenId);
+      const panel: UiPanelNode = {
+        type: "panel",
+        id: `panel-agent-chat-${Date.now()}`,
+        title: "Operational Agent — Live Copilot",
+        subtitle: "Conversational broadcast switcher & director assistant",
+        icon: "smart_toy",
+        tone: "default",
+        zone: "main",
+        sourceLabel: "Summoned Agent",
+        collapsible: false,
+        collapsed: false,
+        pinned: true,
+        ...(mouse?.rect ? { rectHint: mouse.rect } : {}),
+        ...(condition ? { condition } : {}),
+        actions: [
+          {
+            id: `act-agent-pause-${Date.now()}`,
+            label: "Pause Agent",
+            action: "dispatch",
+            params: { target: "agent", command: "pause" },
+            variant: "secondary",
+            icon: "pause",
+          },
+        ],
+        children: [
+          {
+            type: "component",
+            id: `comp-agent-card-${Date.now()}`,
+            component: "agent-card",
+            props: {
+              name: "Broadcast Copilot",
+              role: "Autonomous switcher & operator assistant",
+              status: "online",
+              model: "qwen2.5:7b-instruct",
+            },
+            actions: [],
+          },
+          {
+            type: "component",
+            id: `comp-agent-toolbar-${Date.now()}`,
+            component: "agent-control-toolbar",
+            props: {
+              agentId: "copilot",
+              status: "online",
+              activeTarget: "ATEM / Cameras / Audio",
+            },
+            actions: [],
+          },
+          {
+            type: "component",
+            id: `comp-agent-chat-${Date.now()}`,
+            component: "agent-chat-bubble",
+            props: {
+              speaker: "Copilot",
+              role: "assistant",
+              message:
+                "Operational Agent ready. Use this summoned prompt bar to issue live broadcast commands (e.g. cut cameras, set presets, adjust faders) or ask for operational assistance.",
+            },
+            actions: [],
+          },
+        ],
+      };
+
+      const updated = this.appendPanelToSpec(spec, panel, "Summoned Operational Agent Chat Bar");
+      return {
+        ok: true,
+        agentId: "prompted-creator-agent",
+        intent: "screen_layout",
+        source: "deterministic-compiler",
+        targetScreenId: updated.screenId,
+        summary: `Summoned operational agent chat prompt bar on ${updated.screenId}`,
+        screen: updated,
+        contextUsed,
+      };
+    }
+
+    // 0C. UI-Cues: e.g. "show button that puts graveyard graphic on dsk if speaker speaks about resurrection"
+    const phraseCueMatch =
+      /\b(?:if|when|whenever)\s+(?:speaker\s+speaks\s+about|phrase|word|topic|spoken)\s+["']?([a-zA-Z0-9_\s-]+?)["']?(?:\b|$)/i.exec(
+        promptText
+      );
+    if (phraseCueMatch) {
+      const phrase = phraseCueMatch[1]!.trim().toLowerCase();
+      const parsedAction = parseActionTargetsFromPrompt(promptText);
+      const actionTargets = parsedAction?.targets ?? [
+        { dsk: { id: 1, graphic: "graveyard", onAir: true } },
+      ];
+      const actionLabel = parsedAction?.label ?? "DSK Graphic Overlay";
+
+      const ruleName = `UI-Cue: ${actionLabel} (phrase: "${phrase}")`;
+      const panel: UiPanelNode = {
+        type: "panel",
+        id: `panel-uicue-${Date.now()}`,
+        title: actionLabel,
+        subtitle: `Triggered when phrase "${phrase}" is spoken in broadcast STT`,
+        icon: "graphic_eq",
+        tone: "standing-rule",
+        zone: "main",
+        sourceLabel: `UI-Cue: phrase "${phrase}"`,
+        collapsible: false,
+        collapsed: false,
+        pinned: true,
+        actions: [
+          {
+            id: `act-uicue-btn-${Date.now()}`,
+            label: actionLabel,
+            action: "dispatch",
+            params: {},
+            targets: actionTargets,
+            variant: "primary",
+            icon: "visibility",
+          },
+        ],
+        children: [
+          {
+            type: "component",
+            id: `comp-uicue-btn-${Date.now()}`,
+            component: "button",
+            props: {
+              label: actionLabel,
+              variant: "primary",
+              icon: "layers",
+            },
+            actions: [
+              {
+                id: `act-uicue-inner-${Date.now()}`,
+                label: actionLabel,
+                action: "dispatch",
+                params: {},
+                targets: actionTargets,
+                variant: "primary",
+                icon: "layers",
+              },
+            ],
+          },
+        ],
+      };
+
+      const createdRule = this.rulesStore.addRule({
+        name: ruleName,
+        description: promptText,
+        promptText,
+        targetScreenId,
+        targetZone: "main",
+        container: "panel",
+        durability,
+        enabled: true,
+        trigger: {
+          phase: "live",
+          section: condition?.section ?? null,
+          conditionOperator: condition?.operator ?? "during",
+          directorState: "any",
+          audioClassification: "any",
+          phrase,
+          phraseHoldSec: 120,
+        },
+        panel,
+      });
+
+      this.reactiveAgent.composeAll(`standing_rule_added:${createdRule.id}`);
+      const updatedScreen =
+        this.state.getScreen(targetScreenId)?.spec ??
+        this.reactiveAgent.composeScreen(targetScreenId, `standing_rule:${createdRule.id}`);
+
+      return {
+        ok: true,
+        agentId: "prompted-creator-agent",
+        intent: "standing_rule",
+        source: "deterministic-compiler",
+        targetScreenId,
+        summary: `Created UI-cue '${ruleName}' on ${targetScreenId} (triggered when phrase "${phrase}" is heard)`,
+        rule: createdRule,
+        screen: updatedScreen,
+        contextUsed,
+      };
+    }
+
+    // 0D. Button with action targets: e.g. Button to issue "cam1 preset 4, cut after moved"
+    const parsedTargets = parseActionTargetsFromPrompt(promptText);
+    if (parsedTargets && /\b(button|controls?|action|bind)\b/i.test(promptText)) {
+      const spec = this.ensureTargetSpec(targetScreenId);
+      const panel: UiPanelNode = {
+        type: "panel",
+        id: `panel-action-btn-${Date.now()}`,
+        title: parsedTargets.label,
+        subtitle: `Bound hardware target(s): ${parsedTargets.targets.map((t) => JSON.stringify(t)).join(", ")}`,
+        icon: "touch_app",
+        tone: "default",
+        zone: "main",
+        sourceLabel: "Prompted Action Target",
+        collapsible: false,
+        collapsed: false,
+        pinned: false,
+        ...(mouse?.rect ? { rectHint: mouse.rect } : {}),
+        ...(condition ? { condition } : {}),
+        ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
+        actions: [
+          {
+            id: `act-dispatch-target-${Date.now()}`,
+            label: parsedTargets.label,
+            action: "dispatch",
+            params: {},
+            targets: parsedTargets.targets,
+            variant: "primary",
+            icon: "play_arrow",
+          },
+        ],
+        children: [
+          {
+            type: "component",
+            id: `comp-button-target-${Date.now()}`,
+            component: "button",
+            props: {
+              label: parsedTargets.label,
+              variant: "primary",
+              icon: "touch_app",
+            },
+            actions: [
+              {
+                id: `act-btn-target-${Date.now()}`,
+                label: parsedTargets.label,
+                action: "dispatch",
+                params: {},
+                targets: parsedTargets.targets,
+                variant: "primary",
+                icon: "touch_app",
+              },
+            ],
+            ...(condition ? { condition } : {}),
+            ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
+          },
+        ],
+      };
+
+      const updated = this.appendPanelToSpec(spec, panel, `Added button: ${parsedTargets.label}`);
+      return {
+        ok: true,
+        agentId: "prompted-creator-agent",
+        intent: "screen_layout",
+        source: "deterministic-compiler",
+        targetScreenId: updated.screenId,
+        summary: `Added button '${parsedTargets.label}' mapped to action target(s) on ${updated.screenId}`,
+        screen: updated,
+        contextUsed,
+      };
+    }
+
+    // 0E. Sent Captions feed: e.g. "show me sent captions while sermon is going on"
+    if (
+      /\b(?:captions?|subtitles?)\b/i.test(lower) &&
+      /\b(?:sent|youtube|relay|feed)\b/i.test(lower)
+    ) {
+      const spec = this.ensureTargetSpec(targetScreenId);
+      const isSentOnly = /\b(?:sent|delivered)\b/i.test(lower);
+      const panel: UiPanelNode = {
+        type: "panel",
+        id: `panel-captions-feed-${Date.now()}`,
+        title: isSentOnly ? "Live Sent Captions Feed" : "Live Captions Monitor",
+        subtitle: isSentOnly
+          ? "Filtered to captions sent to broadcast stream / YouTube"
+          : "Full sanctuary speech-to-text feed",
+        icon: "subtitles",
+        tone: "default",
+        zone: "main",
+        sourceLabel: "Captions Feed",
+        collapsible: false,
+        collapsed: false,
+        pinned: false,
+        ...(mouse?.rect ? { rectHint: mouse.rect } : {}),
+        ...(condition ? { condition } : {}),
+        ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
+        actions: [],
+        children: [
+          {
+            type: "component",
+            id: `comp-captions-feed-${Date.now()}`,
+            component: "live-captions-feed",
+            props: {
+              sentOnly: isSentOnly,
+              isVoiceActive: ctx.hardware.voiceActive,
+            },
+            actions: [],
+            ...(condition ? { condition } : {}),
+            ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
+          },
+        ],
+      };
+
+      const updated = this.appendPanelToSpec(spec, panel, "Added sent captions feed");
+      return {
+        ok: true,
+        agentId: "prompted-creator-agent",
+        intent: "screen_layout",
+        source: "deterministic-compiler",
+        targetScreenId: updated.screenId,
+        summary: `Added ${isSentOnly ? "sent" : "live"} captions feed on ${updated.screenId}${condition ? ` (condition: ${condition.operator} ${condition.section})` : ""}`,
+        screen: updated,
+        contextUsed,
+      };
+    }
 
     // A. Save Named UI Component: e.g. "save these as sermon controls" or "save this as audio strip"
     const saveMatch = /\bsave\s+(?:these|this|selection|components?|panels?)\s+as\s+["']?(.+?)["']?$/i.exec(

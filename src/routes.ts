@@ -4,9 +4,11 @@ import type { ContextReactiveUiAgent } from "./agents/context-reactive-agent.js"
 import type { PromptedUiCreatorAgent } from "./agents/prompted-creator-agent.js";
 import type { ComposerEventBroker } from "./events.js";
 import { renderGuiPageHtml } from "./gui/render-gui.js";
+import { buildComponentCatalog } from "./catalog/component-catalog.js";
 import type { EcosystemIngestor } from "./ingest/ecosystem-ingestor.js";
 import type { StandingRulesStore } from "./rules/standing-rules-store.js";
 import {
+  RundownActionItemSchema,
   StandingUiRuleCreateSchema,
   TimeSeriesMetricSchema,
   UiScreenRectSchema,
@@ -363,6 +365,64 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDependencies): v
     reactiveAgent.composeAll(`rule_removed:${request.params.id}`);
     return {
       ok: true,
+    };
+  });
+
+  app.get("/api/v1/catalog/components", async () => {
+    return {
+      catalog: buildComponentCatalog(),
+    };
+  });
+
+  app.post("/api/v1/actions/dispatch", async (request, reply) => {
+    const schema = z.object({
+      targets: z.array(RundownActionItemSchema),
+      actionId: z.string().optional(),
+      source: z.string().optional(),
+    });
+    const parsed = schema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: "Invalid dispatch payload",
+        details: parsed.error.format(),
+      });
+    }
+
+    eventBroker.emit({
+      type: "action-dispatched",
+      data: {
+        targets: parsed.data.targets,
+        source: parsed.data.source ?? "api",
+      },
+    });
+
+    return {
+      ok: true,
+      executedCount: parsed.data.targets.length,
+      targets: parsed.data.targets,
+    };
+  });
+
+  app.post("/api/v1/transcript", async (request, reply) => {
+    const schema = z.object({
+      text: z.string().min(1),
+      timestamp: z.string().optional(),
+    });
+    const parsed = schema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: "Invalid transcript payload",
+        details: parsed.error.format(),
+      });
+    }
+
+    state.ingestTranscript(parsed.data.text, parsed.data.timestamp);
+    reactiveAgent.composeAll("transcript_updated");
+
+    return {
+      ok: true,
+      text: parsed.data.text,
+      matchingRulesCount: rulesStore.getMatchingRules(state.getContext(), "*").length,
     };
   });
 

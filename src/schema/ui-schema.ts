@@ -75,13 +75,23 @@ export const UiActionTypeSchema = z.enum([
   "tally.cue",
   "voice.captureStart",
   "macro.execute",
+  "dispatch",
 ]);
 export type UiActionType = z.infer<typeof UiActionTypeSchema>;
+
+/**
+ * A pirundown ActionItem (object form like `{ cam: { id: 1, preset: 4, cutAfterMoved: true } }`
+ * or shorthand string like `"cam:1:preset:4"`). Buttons can bind any number of these as targets,
+ * so a single UI primitive can drive cameras, ATEM/DSK, tally, pipgm, variables, fetches, etc.
+ */
+export const RundownActionItemSchema = z.union([z.string(), z.record(z.string(), z.unknown())]);
+export type RundownActionItem = z.infer<typeof RundownActionItemSchema>;
 
 export const UiMacroStepSchema = z.object({
   id: z.string().optional(),
   action: UiActionTypeSchema,
   params: z.record(z.string(), z.unknown()).default({}),
+  targets: z.array(RundownActionItemSchema).optional(),
   label: z.string().optional(),
   delayMs: z.number().nonnegative().optional(),
 });
@@ -92,6 +102,7 @@ export const UiActionBindingSchema = z.object({
   label: z.string(),
   action: UiActionTypeSchema,
   params: z.record(z.string(), z.unknown()).default({}),
+  targets: z.array(RundownActionItemSchema).optional(),
   steps: z.array(UiMacroStepSchema).optional(),
   variant: z
     .enum(["primary", "secondary", "danger", "ghost", "surface-high", "atem-pgm", "atem-pvw"])
@@ -105,24 +116,58 @@ export type UiActionBinding = z.infer<typeof UiActionBindingSchema>;
 export type UiActionButton = UiActionBinding;
 
 /**
- * Typed PiUI Component Nodes (Atoms & Molecules inside Panels / Divisions / Documents / Hovers)
+ * Typed PiUI Component Nodes (Atoms & Molecules inside Panels / Divisions / Documents / Hovers).
+ * Every atom and molecule exported by @piecosystem/piui is listed here, plus picomposer-native
+ * composites (macro-button, timer-display, timeseries-chart, wireless-mic-bank, ...).
  */
-export const UiComponentKindSchema = z.enum([
+export const PIUI_ATOM_KINDS = [
+  "icon",
+  "status-dot",
+  "badge",
+  "button",
+  "card",
+  "slider",
+  "toggle-switch",
+  "stat-display",
+  "meter",
+  "text-input",
+  "speaker-badge",
+  "agent-status-badge",
+  "agent-priority-pill",
+  "model-badge",
+] as const;
+
+export const PIUI_MOLECULE_KINDS = [
+  "caption-item",
+  "live-captions-feed",
+  "stream-status-card",
+  "encoder-monitor",
+  "audio-fader",
+  "ptz-pad",
+  "ptz-preset-card",
+  "cue-button-group",
+  "tally-facet-widget",
+  "atem-bus-selector",
+  "matrix-route-row",
+  "routing-output-card",
+  "radio-player-card",
+  "slide-feed-card",
+  "ecosystem-health-card",
+  "cue-trigger-badge",
+  "rundown-item-card",
+  "agent-card",
+  "agent-chat-bubble",
+  "agent-tool-invocation-card",
+  "agent-control-toolbar",
+] as const;
+
+export const COMPOSER_COMPONENT_KINDS = [
   "director-advisory-card",
   "director-active-shot-card",
   "manual-override-card",
   "graphics-lower-third-panel",
   "preflight-checklist-card",
-  "atem-bus-selector",
-  "ptz-pad",
-  "ptz-preset-card",
-  "tally-facet-widget",
-  "cue-button-group",
-  "audio-fader",
   "wireless-mic-bank",
-  "rundown-item-card",
-  "stream-status-card",
-  "live-captions-feed",
   "steering-notes-list",
   "decision-log-list",
   "action-button-group",
@@ -130,6 +175,12 @@ export const UiComponentKindSchema = z.enum([
   "timer-display",
   "timeseries-chart",
   "stat-grid",
+] as const;
+
+export const UiComponentKindSchema = z.enum([
+  ...PIUI_ATOM_KINDS,
+  ...PIUI_MOLECULE_KINDS,
+  ...COMPOSER_COMPONENT_KINDS,
 ]);
 export type UiComponentKind = z.infer<typeof UiComponentKindSchema>;
 
@@ -312,7 +363,9 @@ export const SavedUiComponentSchema = z.object({
 export type SavedUiComponent = z.infer<typeof SavedUiComponentSchema>;
 
 /**
- * Standing UI Rule Schema
+ * UI Cue (a.k.a. standing UI rule) trigger. A UI cue mounts a panel/hover on a view while its
+ * trigger holds: a rundown section/cue condition, director state, audio class, and/or a spoken
+ * phrase/topic heard in captions (e.g. "if speaker speaks about resurrection").
  */
 export const StandingRuleTriggerSchema = z.object({
   phase: z.enum(["preflight", "live", "post", "always"]).default("live"),
@@ -322,6 +375,8 @@ export const StandingRuleTriggerSchema = z.object({
   conditionOperator: z.enum(["during", "after", "before", "not_during", "always"]).default("during"),
   directorState: z.enum(["advising", "directing", "manual", "any"]).default("any"),
   audioClassification: z.enum(["speech", "music", "silence", "any"]).default("any"),
+  phrase: z.string().nullable().optional(),
+  phraseHoldSec: z.number().positive().default(120).optional(),
 });
 export type StandingRuleTrigger = z.infer<typeof StandingRuleTriggerSchema>;
 

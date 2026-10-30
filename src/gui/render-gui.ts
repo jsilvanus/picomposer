@@ -6,6 +6,7 @@ import {
   renderPanel,
   renderScreenFrame,
 } from "@piecosystem/piui";
+import { renderPiuiComponent } from "../catalog/component-catalog.js";
 import type {
   LastMessageContext,
   MouseSelectionContext,
@@ -51,12 +52,16 @@ function renderActionButtonHtml(btn: UiActionButton, ctx: BroadcastContextState)
     btn.steps && btn.steps.length > 0
       ? ` data-macro-steps="${escapeHtml(JSON.stringify(btn.steps))}"`
       : "";
+  const targetsAttr =
+    btn.targets && btn.targets.length > 0
+      ? ` data-action-targets="${escapeHtml(JSON.stringify(btn.targets))}"`
+      : "";
 
   const timerBadge = btn.showForSec
     ? ` <span class="gui-timed-badge" data-countdown-expires="${escapeHtml(btn.expiresAt ?? "")}">⏱ ${formatSec(btn.showForSec)}</span>`
     : "";
 
-  return `<span class="gui-action-wrap"${condAttr}${timerAttr}${hiddenAttr}${macroAttr} data-action-id="${escapeHtml(btn.id)}" data-action-name="${escapeHtml(btn.action)}">${renderButton({
+  return `<span class="gui-action-wrap"${condAttr}${timerAttr}${hiddenAttr}${macroAttr}${targetsAttr} data-action-id="${escapeHtml(btn.id)}" data-action-name="${escapeHtml(btn.action)}">${renderButton({
     label: btn.label,
     variant: btn.variant,
     icon: btn.icon,
@@ -239,19 +244,24 @@ function renderComponentHtml(comp: UiComponentNode, ctx: BroadcastContextState):
     }
 
     default: {
-      const entries = Object.entries(props)
-        .slice(0, 6)
-        .map(
-          ([k, v]) =>
-            `<div class="gui-kv"><span>${escapeHtml(k)}:</span> <strong>${escapeHtml(
-              typeof v === "object" ? JSON.stringify(v) : String(v)
-            )}</strong></div>`
-        )
-        .join("");
-      inner = `<div class="gui-generic-comp">
-        <div class="gui-comp-type">${escapeHtml(comp.component)}</div>
-        ${entries}
-      </div>`;
+      const piuiHtml = renderPiuiComponent(comp.component, props);
+      if (piuiHtml) {
+        inner = piuiHtml;
+      } else {
+        const entries = Object.entries(props)
+          .slice(0, 6)
+          .map(
+            ([k, v]) =>
+              `<div class="gui-kv"><span>${escapeHtml(k)}:</span> <strong>${escapeHtml(
+                typeof v === "object" ? JSON.stringify(v) : String(v)
+              )}</strong></div>`
+          )
+          .join("");
+        inner = `<div class="gui-generic-comp">
+          <div class="gui-comp-type">${escapeHtml(comp.component)}</div>
+          ${entries}
+        </div>`;
+      }
       break;
     }
   }
@@ -924,6 +934,27 @@ export function renderGuiPageHtml(options: RenderGuiPageOptions): string {
           window.location.reload();
         } else {
           statusMsg.textContent = "Error composing UI";
+        }
+      });
+
+      // Button Action Dispatcher (forwarding targets to /api/v1/actions/dispatch)
+      workspace.addEventListener("click", async (e) => {
+        if (editing) return;
+        const btn = e.target.closest("[data-action-targets]");
+        if (!btn) return;
+        const rawTargets = btn.getAttribute("data-action-targets");
+        const actionId = btn.getAttribute("data-action-id") || undefined;
+        if (rawTargets) {
+          try {
+            const targets = JSON.parse(rawTargets);
+            await fetch("/api/v1/actions/dispatch", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ targets, actionId, source: "gui_button" }),
+            });
+          } catch (err) {
+            console.error("Failed to dispatch targets", err);
+          }
         }
       });
     })();

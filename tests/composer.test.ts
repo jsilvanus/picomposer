@@ -464,3 +464,190 @@ test("Multi-screen named pages & numbered views (/gui/:name/:number), UI editing
 
   await app.close();
 });
+
+
+test("Generative UI: Action targets on primitives, sent captions feed, UI-cues with phrase trigger, agent chat bar summoning, and direct command guard", async (t) => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "picomposer-test-targets-"));
+  t.after(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  const config = loadConfig({
+    PICOMPOSER_RULES_FILE: path.join(tmpDir, "standing-rules.json"),
+  });
+  const { app } = buildApp(config);
+  await app.ready();
+
+  // 1. Component catalog endpoint returns all atoms, molecules, and composer composites
+  const catalogRes = await app.inject({
+    method: "GET",
+    url: "/api/v1/catalog/components",
+  });
+  assert.equal(catalogRes.statusCode, 200);
+  const catalog = catalogRes.json().catalog;
+  assert.ok(catalog.length >= 35);
+  const kinds = catalog.map((c: any) => c.kind);
+  assert.ok(kinds.includes("button"));
+  assert.ok(kinds.includes("live-captions-feed"));
+  assert.ok(kinds.includes("atem-bus-selector"));
+  assert.ok(kinds.includes("agent-card"));
+  assert.ok(kinds.includes("agent-control-toolbar"));
+  assert.ok(kinds.includes("agent-chat-bubble"));
+
+  // 2. Direct broadcast command guard: UI agent does NOT execute direct broadcast commands
+  const directCmdRes = await app.inject({
+    method: "POST",
+    url: "/api/v1/prompt",
+    payload: {
+      prompt: "cut to cam 1",
+      pageName: "operator",
+      viewNumber: 1,
+    },
+  });
+  assert.equal(directCmdRes.statusCode, 200);
+  const directCmdBody = directCmdRes.json();
+  assert.ok(directCmdBody.summary.includes("not execute live broadcast commands directly"));
+  assert.ok(directCmdBody.summary.includes("summon an operational agent"));
+
+  // 3. User asks for an agent -> operational chat prompt bar is summoned
+  const summonAgentRes = await app.inject({
+    method: "POST",
+    url: "/api/v1/prompt",
+    payload: {
+      prompt: "summon agent chat prompt bar",
+      pageName: "operator",
+      viewNumber: 1,
+    },
+  });
+  assert.equal(summonAgentRes.statusCode, 200);
+  const summonBody = summonAgentRes.json();
+  assert.ok(summonBody.summary.includes("Summoned operational agent chat prompt bar"));
+  const allComps = summonBody.screen.divisions.flatMap((d: any) =>
+    d.slots.flatMap((s: any) => s.panels.flatMap((p: any) => p.children))
+  );
+  const summonedKinds = allComps.map((c: any) => c.component);
+  assert.ok(summonedKinds.includes("agent-card"));
+  assert.ok(summonedKinds.includes("agent-control-toolbar"));
+  assert.ok(summonedKinds.includes("agent-chat-bubble"));
+
+  // 4. Primitives mapped to action targets: Button to issue "cam1 preset 4, cut after moved"
+  const targetBtnRes = await app.inject({
+    method: "POST",
+    url: "/api/v1/prompt",
+    payload: {
+      prompt: 'Button to issue "cam1 preset 4, cut after moved"',
+      pageName: "operator",
+      viewNumber: 1,
+    },
+  });
+  assert.equal(targetBtnRes.statusCode, 200);
+  const targetBtnBody = targetBtnRes.json();
+  assert.ok(targetBtnBody.summary.includes("Cam 1 Preset 4 (Cut after moved)"));
+  const btnPanel = targetBtnBody.screen.divisions[0].slots[0].panels.find(
+    (p: any) => p.title && p.title.includes("Cam 1 Preset 4")
+  );
+  assert.ok(btnPanel);
+  assert.equal(btnPanel.actions[0].action, "dispatch");
+  assert.deepEqual(btnPanel.actions[0].targets, [
+    { cam: { id: 1, preset: 4, cutAfterMoved: true } },
+  ]);
+
+  // 5. Sent captions feed: "show me sent captions while sermon is going on"
+  const captionsRes = await app.inject({
+    method: "POST",
+    url: "/api/v1/prompt",
+    payload: {
+      prompt: "show me sent captions while sermon is going on",
+      pageName: "operator",
+      viewNumber: 1,
+    },
+  });
+  assert.equal(captionsRes.statusCode, 200);
+  const captionsBody = captionsRes.json();
+  const captionsComp = captionsBody.screen.divisions[0].slots[0].panels
+    .flatMap((p: any) => p.children)
+    .find((c: any) => c.component === "live-captions-feed");
+  assert.ok(captionsComp);
+  assert.equal(captionsComp.props.sentOnly, true);
+  assert.deepEqual(captionsComp.condition, { operator: "during", section: "sermon" });
+
+  // 6. UI-Cues (phrase-triggered standing UI rules):
+  // "show button that puts graveyard graphic on dsk if speaker speaks about resurrection"
+  const uiCueRes = await app.inject({
+    method: "POST",
+    url: "/api/v1/prompt",
+    payload: {
+      prompt: "show button that puts graveyard graphic on dsk if speaker speaks about resurrection",
+      pageName: "operator",
+      viewNumber: 1,
+    },
+  });
+  assert.equal(uiCueRes.statusCode, 200);
+  const uiCueBody = uiCueRes.json();
+  assert.equal(uiCueBody.intent, "standing_rule");
+  assert.ok(uiCueBody.rule);
+  assert.equal(uiCueBody.rule.trigger.phrase, "resurrection");
+  assert.deepEqual(uiCueBody.rule.panel.actions[0].targets, [
+    { dsk: { id: 1, graphic: "graveyard", onAir: true } },
+  ]);
+
+  // Transition broadcast to LIVE
+  await app.inject({
+    method: "POST",
+    url: "/api/v1/ingest/event",
+    payload: {
+      type: "pitube",
+      data: { state: "live" },
+    },
+  });
+
+  // Check matching rules BEFORE phrase is heard -> 0 matching rules with resurrection phrase
+  const rulesBeforeRes = await app.inject({
+    method: "GET",
+    url: "/api/v1/rules",
+  });
+  assert.equal(rulesBeforeRes.statusCode, 200);
+  assert.equal(rulesBeforeRes.json().rules.length, 1);
+
+  const screenBeforeTranscript = (
+    await app.inject({ method: "GET", url: "/api/v1/screens/operator" })
+  ).json().screen.spec;
+  assert.equal(screenBeforeTranscript.activeStandingRuleIds.length, 0);
+
+  // Now speaker says "resurrection" in sermon -> ingested via /api/v1/transcript
+  const transcriptRes = await app.inject({
+    method: "POST",
+    url: "/api/v1/transcript",
+    payload: {
+      text: "Ja tänään me julistamme Kristuksen ylösnousemusta ja resurrection voimaa.",
+    },
+  });
+  assert.equal(transcriptRes.statusCode, 200);
+  assert.equal(transcriptRes.json().matchingRulesCount, 1);
+
+  // Screen now has activeStandingRuleIds containing the resurrection UI cue
+  const screenAfterTranscript = (
+    await app.inject({ method: "GET", url: "/api/v1/screens/operator" })
+  ).json().screen.spec;
+  assert.equal(screenAfterTranscript.activeStandingRuleIds.length, 1);
+  assert.equal(screenAfterTranscript.activeStandingRuleIds[0], uiCueBody.rule.id);
+
+  // 7. Verify /api/v1/actions/dispatch endpoint executes hardware target
+  const dispatchRes = await app.inject({
+    method: "POST",
+    url: "/api/v1/actions/dispatch",
+    payload: {
+      targets: [{ cam: { id: 1, preset: 4, cutAfterMoved: true } }],
+      source: "gui_test",
+    },
+  });
+  assert.equal(dispatchRes.statusCode, 200);
+  assert.equal(dispatchRes.json().executedCount, 1);
+
+  // 8. Rendered HTML in /gui/operator/1 includes action targets and piui component elements
+  const guiHtml = (await app.inject({ method: "GET", url: "/gui/operator/1" })).body;
+  assert.ok(guiHtml.includes('data-action-targets="[{&quot;cam&quot;:'));
+  assert.ok(guiHtml.includes("Cam 1 Preset 4 (Cut after moved)"));
+
+  await app.close();
+});

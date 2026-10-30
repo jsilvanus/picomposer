@@ -46,7 +46,7 @@ export class StandingRulesStore {
     return this.rules
       .filter((rule) => {
         if (!rule.enabled) return false;
-        if (rule.targetScreenId !== "*" && rule.targetScreenId !== screenId) {
+        if (screenId !== "*" && rule.targetScreenId !== "*" && rule.targetScreenId !== screenId) {
           return false;
         }
 
@@ -98,6 +98,24 @@ export class StandingRulesStore {
 
         if (t.audioClassification && t.audioClassification !== "any") {
           if (context.hardware.audioClassification !== t.audioClassification) {
+            return false;
+          }
+        }
+
+        if (t.phrase && t.phrase.trim()) {
+          const targetPhrase = t.phrase.trim().toLowerCase();
+          const holdSec = t.phraseHoldSec ?? 120;
+          const nowMs = Date.now();
+          const matchesRecent = (context.captions?.recentPhrases ?? []).some((item) => {
+            const itemMs = new Date(item.timestamp).getTime();
+            const ageSec = Number.isNaN(itemMs) ? 0 : (nowMs - itemMs) / 1000;
+            if (ageSec > holdSec) return false;
+            return item.phrase.includes(targetPhrase);
+          });
+          const matchesLast = (context.captions?.lastTranscript ?? "")
+            .toLowerCase()
+            .includes(targetPhrase);
+          if (!matchesRecent && !matchesLast) {
             return false;
           }
         }
