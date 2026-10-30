@@ -6,7 +6,11 @@ import {
   type StandingUiRule,
   type StandingUiRuleCreate,
 } from "../schema/ui-schema.js";
-import type { BroadcastContextState } from "../state/composer-state.js";
+import {
+  evaluateVisibilityCondition,
+  matchesSectionOrTopic,
+  type BroadcastContextState,
+} from "../state/composer-state.js";
 
 export interface StandingRulesStoreOptions {
   filePath?: string | undefined;
@@ -51,40 +55,33 @@ export class StandingRulesStore {
           return false;
         }
 
-        if (t.section) {
-          const targetSec = t.section.toLowerCase().trim();
-          const currentSec = (context.rundown.currentSection ?? "").toLowerCase();
-          const currentCueTitle = (context.rundown.currentCueTitle ?? "").toLowerCase();
-          const currentCueId = (context.rundown.currentCueId ?? "").toLowerCase();
-          const matchesSection =
-            currentSec.includes(targetSec) ||
-            currentCueTitle.includes(targetSec) ||
-            currentCueId.includes(targetSec) ||
-            (targetSec === "sermon" &&
-              (currentSec.includes("saarna") || currentCueTitle.includes("saarna"))) ||
-            (targetSec === "saarna" &&
-              (currentSec.includes("sermon") || currentCueTitle.includes("sermon")));
-          if (!matchesSection) return false;
+        const conditionOperator = t.conditionOperator ?? "during";
+        if (t.section || t.subsection || t.cueId) {
+          const matchesCond = evaluateVisibilityCondition(
+            {
+              operator: conditionOperator,
+              section: t.section,
+              subsection: t.subsection,
+              cueId: t.cueId,
+              phase: t.phase,
+            },
+            context
+          );
+          if (!matchesCond) return false;
         }
 
-        if (t.subsection) {
-          const targetSub = t.subsection.toLowerCase().trim();
-          const currentSub = (context.rundown.currentSubsection ?? "").toLowerCase();
-          const currentCueId = (context.rundown.currentCueId ?? "").toLowerCase();
-          const currentCueTitle = (context.rundown.currentCueTitle ?? "").toLowerCase();
-          if (
-            !currentSub.includes(targetSub) &&
-            !currentCueId.includes(targetSub) &&
-            !currentCueTitle.includes(targetSub)
-          ) {
-            return false;
-          }
+        if (t.subsection && conditionOperator === "during") {
+          const targetSub = t.subsection;
+          const matchesSub =
+            matchesSectionOrTopic(context.rundown.currentSubsection, targetSub) ||
+            matchesSectionOrTopic(context.rundown.currentCueId, targetSub) ||
+            matchesSectionOrTopic(context.rundown.currentCueTitle, targetSub);
+          if (!matchesSub) return false;
         }
 
-        if (t.cueId) {
-          const targetCue = t.cueId.toLowerCase().trim();
-          const currentCue = (context.rundown.currentCueId ?? "").toLowerCase();
-          if (currentCue !== targetCue && !currentCue.includes(targetCue)) {
+        if (t.cueId && conditionOperator === "during") {
+          const targetCue = t.cueId;
+          if (!matchesSectionOrTopic(context.rundown.currentCueId, targetCue)) {
             return false;
           }
         }
@@ -115,7 +112,6 @@ export class StandingRulesStore {
     const now = new Date().toISOString();
     const id = parsed.id ?? `rule_${this.seq++}`;
 
-    // Replace existing rule if same ID
     const existingIdx = this.rules.findIndex((r) => r.id === id);
     const rule: StandingUiRule = {
       id,
@@ -173,9 +169,6 @@ export class StandingRulesStore {
     return true;
   }
 
-  /**
-   * Clears temporary per-broadcast rules when a broadcast ends while preserving persistent standing rules.
-   */
   clearBroadcastScopedRules(): number {
     const before = this.rules.length;
     const kept = this.rules.filter((r) => r.durability === "persistent");

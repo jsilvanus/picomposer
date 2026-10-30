@@ -3,9 +3,15 @@ import type { StandingRulesStore } from "../rules/standing-rules-store.js";
 import {
   StandingUiRuleCreateSchema,
   UiScreenSpecSchema,
+  type MouseSelectionContext,
+  type SavedUiComponent,
   type StandingUiRule,
+  type TimeSeriesMetric,
+  type UiComponentNode,
+  type UiMacroStep,
   type UiPanelNode,
   type UiScreenSpec,
+  type UiVisibilityCondition,
 } from "../schema/ui-schema.js";
 import type { BroadcastContextState, ComposerState } from "../state/composer-state.js";
 import type { ContextReactiveUiAgent } from "./context-reactive-agent.js";
@@ -24,24 +30,75 @@ export interface PromptedCreatorAgentOptions {
 export interface PromptExecutionResult {
   ok: true;
   agentId: "prompted-creator-agent";
-  intent: "standing_rule" | "screen_layout";
+  intent: "standing_rule" | "screen_layout" | "save_component" | "modify_selection";
   source: "ollama" | "deterministic-compiler";
   targetScreenId: string;
   summary: string;
   rule?: StandingUiRule | undefined;
+  savedComponent?: SavedUiComponent | undefined;
   screen: UiScreenSpec;
+  contextUsed: {
+    broadcast: boolean;
+    mouse: boolean;
+    lastMessage: boolean;
+  };
+}
+
+/**
+ * Helper to extract visibility conditions from natural language prompts,
+ * e.g. "show only after sermon has passed", "before communion", "during sermon".
+ */
+export function parseVisibilityConditionFromPrompt(promptText: string): UiVisibilityCondition | undefined {
+  const lower = promptText.toLowerCase();
+  let section: string | undefined;
+  if (lower.includes("sermon") || lower.includes("saarna")) section = "sermon";
+  else if (lower.includes("communion") || lower.includes("ehtoollinen")) section = "communion";
+  else if (lower.includes("prayer") || lower.includes("rukous") || lower.includes("intercession")) section = "intercession";
+  else if (lower.includes("hymn") || lower.includes("virsi") || lower.includes("intro")) section = "intro";
+
+  if (/\b(?:after|once)\b.*\b(?:passed|ended|finished|done|over|sermon|saarna|communion|prayer|intro)/i.test(promptText) || /\bafter\s+(?:the\s+)?(?:sermon|saarna|communion|prayer|intro)\b/i.test(promptText)) {
+    return {
+      operator: "after",
+      section: section ?? "sermon",
+    };
+  }
+  if (/\bbefore\s+(?:the\s+)?(?:sermon|saarna|communion|prayer|intro)\b/i.test(promptText)) {
+    return {
+      operator: "before",
+      section: section ?? "sermon",
+    };
+  }
+  if (/\b(?:only\s+)?during\s+(?:the\s+)?(?:sermon|saarna|communion|prayer|intro)\b/i.test(promptText)) {
+    return {
+      operator: "during",
+      section: section ?? "sermon",
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Helper to extract timed duration ("show for 5 minutes", "for 30 seconds") from a prompt.
+ */
+export function parseTimedVisibilitySec(promptText: string): { showForSec?: number; expiresAt?: string } {
+  const m = /\b(?:show\s+)?for\s+(\d+)\s*(min(?:ute)?s?|sec(?:ond)?s?|m|s)\b/i.exec(promptText);
+  if (!m) return {};
+  const amount = Number.parseInt(m[1]!, 10);
+  if (!Number.isFinite(amount) || amount <= 0) return {};
+  const unit = m[2]!.toLowerCase();
+  const sec = unit.startsWith("m") ? amount * 60 : amount;
+  return {
+    showForSec: sec,
+    expiresAt: new Date(Date.now() + sec * 1000).toISOString(),
+  };
 }
 
 /**
  * Agent 2: Prompted UI Creator Agent ("ui-prompt-creator")
  *
  * Explicitly NOT the broadcast director (never switches cameras or issues shot advisories).
- * Knows the full state of the broadcast and the @piecosystem/piui component & layout catalog.
- *
- * Responds to operator natural-language prompts to either:
- * 1. Create a persistent or broadcast-scoped Standing UI Rule (e.g., "Add graphics buttons here during sermon"), OR
- * 2. Generate/modify a typed JSON UiScreenSpec on a target screen (e.g., "Build a PTZ + Tally workspace on screen-2"
- *    or "Show preflight setup checklist").
+ * Knows the full state of the broadcast, mouse selection context, last message context,
+ * and the @piecosystem/piui component & layout catalog.
  */
 export class PromptedUiCreatorAgent {
   private readonly state: ComposerState;
@@ -67,47 +124,762 @@ export class PromptedUiCreatorAgent {
   async handlePrompt(input: {
     prompt: string;
     targetScreenId?: string | undefined;
+    pageName?: string | undefined;
+    viewNumber?: number | undefined;
     durability?: "persistent" | "broadcast" | undefined;
+    useBroadcastContext?: boolean | undefined;
+    useMouseContext?: boolean | undefined;
+    useLastMessageContext?: boolean | undefined;
+    mouseContextOverride?: MouseSelectionContext | undefined;
   }): Promise<PromptExecutionResult> {
     const promptText = input.prompt.trim();
-    const targetScreenId = this.state.resolveScreenId(input.targetScreenId ?? "screen-1");
-    const ctx = this.state.getContext();
+    const resolvedTarget =
+      input.pageName !== undefined || input.viewNumber !== undefined
+        ? this.state.ensurePageView(input.pageName, input.viewNumber).screenId
+        : this.state.resolveScreenId(input.targetScreenId ?? "screen-1");
 
-    // Try Ollama structured JSON compilation first, falling back to deterministic compiler
-    const llmResult = await this.tryOllamaCompile(promptText, targetScreenId, input.durability, ctx);
+    const useBroadcast = input.useBroadcastContext ?? true;
+    const rawMouse = input.mouseContextOverride ?? this.state.getMouseContext();
+    const useMouse = (input.useMouseContext ?? true) && rawMouse.mode !== "none";
+    const lastMsg = this.state.getLastMessageContext();
+    const useLastMsg = Boolean(input.useLastMessageContext && lastMsg);
+
+    const ctx = this.state.getContext();
+    const contextUsed = {
+      broadcast: useBroadcast,
+      mouse: useMouse,
+      lastMessage: useLastMsg,
+    };
+
+    // 1. Check deterministic mouse/component/macro/chart/timer/save commands first if they are specific
+    const specialResult = this.trySpecialCommandCompile(
+      promptText,
+      resolvedTarget,
+      input.durability ?? "persistent",
+      ctx,
+      useMouse ? rawMouse : null,
+      useLastMsg ? lastMsg : null,
+      contextUsed
+    );
+    if (specialResult) {
+      this.recordTurnAndLastMessage(resolvedTarget, promptText, specialResult);
+      return specialResult;
+    }
+
+    // 2. Try Ollama structured JSON compilation
+    const llmResult = await this.tryOllamaCompile(
+      promptText,
+      resolvedTarget,
+      input.durability,
+      useBroadcast ? ctx : null,
+      useMouse ? rawMouse : null,
+      useLastMsg ? lastMsg : null,
+      contextUsed
+    );
     if (llmResult) {
-      this.emitTurn(targetScreenId, promptText, llmResult.summary);
+      this.recordTurnAndLastMessage(resolvedTarget, promptText, llmResult);
       return llmResult;
     }
 
+    // 3. Fallback to deterministic compiler
     const compiled = this.compileDeterministically(
       promptText,
-      targetScreenId,
+      resolvedTarget,
       input.durability ?? "persistent",
-      ctx
+      ctx,
+      useMouse ? rawMouse : null,
+      useLastMsg ? lastMsg : null,
+      contextUsed
     );
-    this.emitTurn(targetScreenId, promptText, compiled.summary);
+    this.recordTurnAndLastMessage(resolvedTarget, promptText, compiled);
     return compiled;
   }
 
-  private emitTurn(targetScreenId: string, prompt: string, summary: string): void {
+  private recordTurnAndLastMessage(
+    targetScreenId: string,
+    prompt: string,
+    result: PromptExecutionResult
+  ): void {
+    const slot = this.state.ensureScreen(targetScreenId);
+    this.state.setLastMessageContext({
+      prompt,
+      responseSummary: result.summary,
+      targetPage: slot.pageName,
+      targetView: slot.viewNumber,
+      targetScreenId: slot.screenId,
+      intent: result.intent,
+      timestamp: new Date().toISOString(),
+    });
     this.eventBroker?.emit({
       type: "agent-turn",
       data: {
         agentId: "prompted-creator-agent",
         trigger: `prompt:${prompt}`,
         targetScreenId,
-        summary,
+        summary: result.summary,
         time: new Date().toISOString(),
       },
     });
+  }
+
+  private ensureTargetSpec(targetScreenId: string): UiScreenSpec {
+    const slot = this.state.ensureScreen(targetScreenId);
+    if (slot.spec) {
+      return structuredClone(slot.spec);
+    }
+    if (slot.managedBy === "context-reactive-agent") {
+      return structuredClone(this.reactiveAgent.composeScreen(slot.screenId, "init_before_prompt"));
+    }
+    return structuredClone(this.reactiveAgent.composeDefaultOperatorWorkspace(slot.screenId, "init_before_prompt"));
+  }
+
+  private appendPanelToSpec(
+    spec: UiScreenSpec,
+    panel: UiPanelNode,
+    reason: string,
+    layoutMode?: "grid" | "document"
+  ): UiScreenSpec {
+    const next = structuredClone(spec);
+    if (layoutMode) {
+      next.layoutMode = layoutMode;
+    }
+    next.updatedAt = new Date().toISOString();
+    next.reason = reason;
+    next.generatedBy = "prompted-creator-agent";
+    if (next.divisions.length === 0) {
+      next.divisions.push({
+        type: "division",
+        id: "div-main",
+        direction: next.layoutMode === "document" ? "vertical" : "grid",
+        columns: next.layoutMode === "document" ? 1 : 2,
+        gap: "md",
+        divided: false,
+        slots: [{ id: "slot-main-1", colSpan: 1, panels: [panel] }],
+      });
+    } else {
+      const targetDiv = next.divisions[0]!;
+      if (targetDiv.slots.length === 0) {
+        targetDiv.slots.push({ id: "slot-main-1", colSpan: 1, panels: [panel] });
+      } else {
+        targetDiv.slots[0]!.panels.push(panel);
+      }
+    }
+    return this.state.setScreenSpec(next.screenId, next);
+  }
+
+  private trySpecialCommandCompile(
+    promptText: string,
+    targetScreenId: string,
+    durability: "persistent" | "broadcast",
+    ctx: BroadcastContextState,
+    mouse: MouseSelectionContext | null,
+    lastMsg: ReturnType<ComposerState["getLastMessageContext"]>,
+    contextUsed: PromptExecutionResult["contextUsed"]
+  ): PromptExecutionResult | null {
+    const lower = promptText.toLowerCase();
+    const condition = parseVisibilityConditionFromPrompt(promptText);
+    const timed = parseTimedVisibilitySec(promptText);
+
+    // A. Save Named UI Component: e.g. "save these as sermon controls" or "save this as audio strip"
+    const saveMatch = /\bsave\s+(?:these|this|selection|components?|panels?)\s+as\s+["']?(.+?)["']?$/i.exec(
+      promptText.trim()
+    );
+    if (saveMatch) {
+      const name = saveMatch[1]!.trim();
+      const spec = this.ensureTargetSpec(targetScreenId);
+      const allPanels = spec.divisions.flatMap((d) => d.slots.flatMap((s) => s.panels));
+      let selectedPanels: UiPanelNode[] = [];
+      let selectedComponents: UiComponentNode[] = [];
+
+      if (mouse && mouse.mode === "component") {
+        if (mouse.panelId) {
+          selectedPanels = allPanels.filter((p) => p.id === mouse.panelId);
+        }
+        if (mouse.componentId) {
+          selectedComponents = allPanels
+            .flatMap((p) => p.children)
+            .filter((c) => c.id === mouse.componentId);
+        }
+      } else if (mouse && mouse.mode === "rectangle") {
+        const panelIds = new Set(mouse.overlappingPanelIds ?? []);
+        const compIds = new Set(mouse.overlappingComponentIds ?? []);
+        if (panelIds.size > 0) {
+          selectedPanels = allPanels.filter((p) => panelIds.has(p.id));
+        }
+        if (compIds.size > 0) {
+          selectedComponents = allPanels
+            .flatMap((p) => p.children)
+            .filter((c) => compIds.has(c.id));
+        }
+      }
+      if (selectedPanels.length === 0 && selectedComponents.length === 0) {
+        selectedPanels = allPanels.slice(0, 2);
+      }
+
+      const saved = this.state.savedComponentsStore.saveComponent({
+        name,
+        description: `Saved from ${spec.pageName}/${spec.viewNumber} via command "${promptText}"`,
+        panels: structuredClone(selectedPanels),
+        components: structuredClone(selectedComponents),
+        sourcePage: spec.pageName,
+        sourceView: spec.viewNumber,
+      });
+
+      return {
+        ok: true,
+        agentId: "prompted-creator-agent",
+        intent: "save_component",
+        source: "deterministic-compiler",
+        targetScreenId: spec.screenId,
+        summary: `Saved ${selectedPanels.length} panel(s) and ${selectedComponents.length} component(s) as reusable component "${saved.name}" (${saved.slug})`,
+        savedComponent: saved,
+        screen: spec,
+        contextUsed,
+      };
+    }
+
+    // B. Insert / Mount a previously Saved Named UI Component: e.g. "insert sermon controls" or "add sermon controls"
+    for (const saved of this.state.savedComponentsStore.list()) {
+      const nameLower = saved.name.toLowerCase();
+      const slugLower = saved.slug.toLowerCase();
+      if (
+        (lower.includes(nameLower) || lower.includes(slugLower)) &&
+        /\b(insert|add|mount|show|load|use|place)\b/i.test(lower) &&
+        !lower.startsWith("save ")
+      ) {
+        const spec = this.ensureTargetSpec(targetScreenId);
+        const panelsToMount: UiPanelNode[] =
+          saved.panels.length > 0
+            ? saved.panels.map((p, idx) => ({
+                ...structuredClone(p),
+                id: `${p.id}-mounted-${Date.now()}-${idx}`,
+                savedComponentName: saved.name,
+                ...(mouse?.rect ? { rectHint: mouse.rect } : {}),
+                ...(condition ? { condition } : {}),
+                ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
+              }))
+            : [
+                {
+                  type: "panel",
+                  id: `panel-saved-${saved.slug}-${Date.now()}`,
+                  title: saved.name,
+                  subtitle: `Saved UI component (${saved.slug})`,
+                  icon: "widgets",
+                  tone: "default",
+                  zone: "main",
+                  savedComponentName: saved.name,
+                  collapsible: false,
+                  collapsed: false,
+                  pinned: false,
+                  ...(mouse?.rect ? { rectHint: mouse.rect } : {}),
+                  ...(condition ? { condition } : {}),
+                  ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
+                  actions: [],
+                  children: saved.components.map((c, idx) => ({
+                    ...structuredClone(c),
+                    id: `${c.id}-mounted-${Date.now()}-${idx}`,
+                  })),
+                },
+              ];
+
+        let updated = spec;
+        for (const p of panelsToMount) {
+          updated = this.appendPanelToSpec(updated, p, `Mounted saved component "${saved.name}"`);
+        }
+        return {
+          ok: true,
+          agentId: "prompted-creator-agent",
+          intent: "screen_layout",
+          source: "deterministic-compiler",
+          targetScreenId: updated.screenId,
+          summary: `Mounted saved component "${saved.name}" on ${updated.screenId}`,
+          savedComponent: saved,
+          screen: updated,
+          contextUsed,
+        };
+      }
+    }
+
+    // C. Mouse Component Removal: e.g. click component + "Remove this" / "Delete this"
+    if (
+      mouse &&
+      mouse.mode !== "none" &&
+      /\b(remove|delete|hide|drop)\b/i.test(lower) &&
+      /\b(this|selected|component|panel|here|area)\b/i.test(lower)
+    ) {
+      const spec = this.ensureTargetSpec(targetScreenId);
+      const targetCompIds = new Set<string>([
+        ...(mouse.componentId ? [mouse.componentId] : []),
+        ...(mouse.overlappingComponentIds ?? []),
+      ]);
+      const targetPanelIds = new Set<string>([
+        ...(mouse.panelId ? [mouse.panelId] : []),
+        ...(mouse.overlappingPanelIds ?? []),
+      ]);
+
+      let removedCount = 0;
+      const nextDivisions = spec.divisions.map((div) => ({
+        ...div,
+        slots: div.slots.map((slot) => {
+          const keptPanels: UiPanelNode[] = [];
+          for (const panel of slot.panels) {
+            if (targetPanelIds.has(panel.id) && targetCompIds.size === 0) {
+              removedCount++;
+              continue;
+            }
+            const beforeChildren = panel.children.length;
+            const filteredChildren = panel.children.filter((c) => !targetCompIds.has(c.id));
+            if (filteredChildren.length < beforeChildren) {
+              removedCount += beforeChildren - filteredChildren.length;
+            }
+            if (filteredChildren.length === 0 && targetPanelIds.has(panel.id)) {
+              removedCount++;
+              continue;
+            }
+            keptPanels.push({
+              ...panel,
+              children: filteredChildren,
+            });
+          }
+          return { ...slot, panels: keptPanels };
+        }),
+      }));
+
+      const updated: UiScreenSpec = {
+        ...spec,
+        updatedAt: new Date().toISOString(),
+        reason: `Removed selected UI element(s): "${promptText}"`,
+        divisions: nextDivisions,
+      };
+      this.state.setScreenSpec(spec.screenId, updated);
+      this.state.clearMouseContext(spec.pageName, spec.viewNumber);
+
+      return {
+        ok: true,
+        agentId: "prompted-creator-agent",
+        intent: "modify_selection",
+        source: "deterministic-compiler",
+        targetScreenId: spec.screenId,
+        summary: `Removed ${removedCount || 1} selected item(s) from ${spec.screenId}`,
+        screen: updated,
+        contextUsed,
+      };
+    }
+
+    // D. Wireless Mics Sound Controls (e.g. draw rectangle + "add here sound controls for wireless mics 1,2,5")
+    if (/\b(wireless|mic(?:rophone)?s?|sound\s+controls?|faders?)\b/i.test(lower)) {
+      const nums = Array.from(promptText.matchAll(/\b(\d{1,2})\b/g))
+        .map((m) => Number.parseInt(m[1]!, 10))
+        .filter((n) => n >= 1 && n <= 32);
+      if (nums.length > 0 || lower.includes("wireless")) {
+        const channels = nums.length > 0 ? Array.from(new Set(nums)) : [1, 2];
+        const spec = this.ensureTargetSpec(targetScreenId);
+        const panel: UiPanelNode = {
+          type: "panel",
+          id: `panel-wireless-mics-${channels.join("-")}`,
+          title: `Sound Controls — Wireless Mics ${channels.join(", ")}`,
+          subtitle: mouse?.rect
+            ? `Placed at (${mouse.rect.x}, ${mouse.rect.y}) ${mouse.rect.width}×${mouse.rect.height}`
+            : `Prompted: "${promptText}"`,
+          icon: "mic",
+          tone: "default",
+          zone: "main",
+          sourceLabel: mouse?.rect ? "Area Selection" : "Prompted UI",
+          collapsible: false,
+          collapsed: false,
+          pinned: false,
+          ...(mouse?.rect ? { rectHint: mouse.rect } : {}),
+          ...(condition ? { condition } : {}),
+          ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
+          actions: channels.map((ch) => ({
+            id: `act-mute-mic-${ch}`,
+            label: `Mute Mic ${ch}`,
+            action: "audio.mute",
+            params: { channel: ch, id: `wireless-${ch}` },
+            variant: "secondary" as const,
+            icon: "mic_off",
+          })),
+          children: [
+            {
+              type: "component",
+              id: `comp-wireless-bank-${channels.join("-")}`,
+              component: "wireless-mic-bank",
+              props: {
+                channels: channels.map((ch) => ({
+                  channel: ch,
+                  id: `wireless-${ch}`,
+                  label: `Wireless Mic ${ch}`,
+                  volumePercent: 80,
+                  muted: false,
+                })),
+              },
+              actions: [],
+              ...(condition ? { condition } : {}),
+              ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
+            },
+            ...channels.map((ch) => ({
+              type: "component" as const,
+              id: `comp-fader-mic-${ch}`,
+              component: "audio-fader" as const,
+              props: {
+                id: `wireless-${ch}`,
+                channel: ch,
+                name: `Wireless Mic ${ch}`,
+                volumePercent: 80,
+              },
+              actions: [],
+            })),
+          ],
+        };
+        const updated = this.appendPanelToSpec(spec, panel, `Added Wireless Mics ${channels.join(", ")}`);
+        return {
+          ok: true,
+          agentId: "prompted-creator-agent",
+          intent: "screen_layout",
+          source: "deterministic-compiler",
+          targetScreenId: updated.screenId,
+          summary: `Added sound controls for wireless mics ${channels.join(", ")} on ${updated.screenId}`,
+          screen: updated,
+          contextUsed,
+        };
+      }
+    }
+
+    // E. Macro Button (e.g. "Button that turns off graphics and fades to black")
+    const isMacroPrompt =
+      /\bmacro\b/i.test(lower) ||
+      (/\bbutton\b/i.test(lower) && /\band\b/i.test(lower)) ||
+      (lower.includes("fade") && lower.includes("black") && lower.includes("graphic"));
+    if (isMacroPrompt) {
+      const steps: UiMacroStep[] = [];
+      if (lower.includes("graphic") || lower.includes("lower third")) {
+        const turnOff = /\b(off|hide|clear|disable)\b/i.test(lower);
+        steps.push({
+          id: "step-graphics",
+          label: turnOff ? "Turn Off Graphics" : "Show Graphics",
+          action: "graphics.lowerThird",
+          params: { showLowerThird: !turnOff },
+          delayMs: 0,
+        });
+      }
+      if (lower.includes("fade") || lower.includes("black") || lower.includes("ftb")) {
+        steps.push({
+          id: "step-ftb",
+          label: "Fade to Black (FTB)",
+          action: "atem.ftb",
+          params: { enabled: true },
+          delayMs: steps.length > 0 ? 250 : 0,
+        });
+      }
+      const cutCamMatch = /\bcut\s+to\s+(?:cam(?:era)?|input)\s*(\d+)\b/i.exec(promptText);
+      if (cutCamMatch) {
+        const inputNum = Number.parseInt(cutCamMatch[1]!, 10);
+        steps.push({
+          id: `step-cut-${inputNum}`,
+          label: `Cut to Input ${inputNum}`,
+          action: "atem.cutInput",
+          params: { input: inputNum },
+          delayMs: steps.length > 0 ? 200 : 0,
+        });
+      }
+      if (lower.includes("mute")) {
+        steps.push({
+          id: "step-mute",
+          label: "Mute Sanctuary Audio",
+          action: "audio.muteAll",
+          params: { muted: true },
+          delayMs: steps.length > 0 ? 200 : 0,
+        });
+      }
+      if (steps.length === 0) {
+        steps.push(
+          {
+            id: "step-1",
+            label: "Hide Lower-Third Graphics",
+            action: "graphics.lowerThird",
+            params: { showLowerThird: false },
+            delayMs: 0,
+          },
+          {
+            id: "step-2",
+            label: "Fade to Black",
+            action: "atem.ftb",
+            params: { enabled: true },
+            delayMs: 250,
+          }
+        );
+      }
+
+      const macroLabel = steps.map((s) => s.label).join(" + ");
+      const spec = this.ensureTargetSpec(targetScreenId);
+      const panel: UiPanelNode = {
+        type: "panel",
+        id: `panel-macro-${Date.now()}`,
+        title: `Macro Control`,
+        subtitle: macroLabel,
+        icon: "bolt",
+        tone: "default",
+        zone: "main",
+        sourceLabel: "Macro",
+        collapsible: false,
+        collapsed: false,
+        pinned: false,
+        ...(mouse?.rect ? { rectHint: mouse.rect } : {}),
+        ...(condition ? { condition } : {}),
+        ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
+        actions: [
+          {
+            id: `act-macro-${Date.now()}`,
+            label: macroLabel,
+            action: "macro.execute",
+            params: { steps },
+            variant: "danger",
+            icon: "bolt",
+            steps,
+            ...(condition ? { condition } : {}),
+            ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
+          },
+        ],
+        children: [
+          {
+            type: "component",
+            id: `comp-macro-${Date.now()}`,
+            component: "macro-button",
+            props: {
+              label: macroLabel,
+              description: promptText,
+              steps,
+            },
+            actions: [
+              {
+                id: `act-comp-macro-${Date.now()}`,
+                label: `Run Macro: ${macroLabel}`,
+                action: "macro.execute",
+                params: { steps },
+                variant: "danger",
+                steps,
+                ...(condition ? { condition } : {}),
+                ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
+              },
+            ],
+            ...(condition ? { condition } : {}),
+            ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
+          },
+        ],
+      };
+
+      const updated = this.appendPanelToSpec(spec, panel, `Added macro button: ${macroLabel}`);
+      return {
+        ok: true,
+        agentId: "prompted-creator-agent",
+        intent: "screen_layout",
+        source: "deterministic-compiler",
+        targetScreenId: updated.screenId,
+        summary: `Added macro button (${macroLabel}) on ${updated.screenId}`,
+        screen: updated,
+        contextUsed,
+      };
+    }
+
+    // F. Time-Series Chart (e.g. "chart of audio levels", "time series chart of caption lag", "bitrate chart")
+    if (/\b(chart|graph|time\s*-?\s*series|plot|trend)\b/i.test(lower)) {
+      let metric: TimeSeriesMetric = "audio_rms_dbfs";
+      if (lower.includes("caption") || lower.includes("lag") || lower.includes("subtitle")) {
+        metric = "caption_lag_ms";
+      } else if (lower.includes("dwell") || lower.includes("shot")) {
+        metric = "shot_dwell_sec";
+      } else if (lower.includes("bitrate") || lower.includes("stream") || lower.includes("kbps")) {
+        metric = "stream_bitrate_kbps";
+      } else if (lower.includes("motion") || lower.includes("ptz") || lower.includes("speed")) {
+        metric = "camera_motion_speed";
+      }
+      const series = this.state.timeSeriesStore.getSeries(metric);
+      const spec = this.ensureTargetSpec(targetScreenId);
+      const panel: UiPanelNode = {
+        type: "panel",
+        id: `panel-chart-${metric}`,
+        title: `${series.label} (${series.unit})`,
+        subtitle: `Live time-series telemetry (${series.points.length} samples)`,
+        icon: "show_chart",
+        tone: "default",
+        zone: "main",
+        sourceLabel: "Telemetry Chart",
+        collapsible: false,
+        collapsed: false,
+        pinned: false,
+        ...(mouse?.rect ? { rectHint: mouse.rect } : {}),
+        ...(condition ? { condition } : {}),
+        ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
+        actions: [],
+        children: [
+          {
+            type: "component",
+            id: `comp-chart-${metric}`,
+            component: "timeseries-chart",
+            props: {
+              metric: series.metric,
+              label: series.label,
+              unit: series.unit,
+              min: series.min,
+              max: series.max,
+              points: series.points,
+            },
+            actions: [],
+            ...(condition ? { condition } : {}),
+            ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
+          },
+        ],
+      };
+
+      const updated = this.appendPanelToSpec(spec, panel, `Added time-series chart for ${series.label}`);
+      return {
+        ok: true,
+        agentId: "prompted-creator-agent",
+        intent: "screen_layout",
+        source: "deterministic-compiler",
+        targetScreenId: updated.screenId,
+        summary: `Added time-series chart '${series.label}' (${metric}) on ${updated.screenId}`,
+        screen: updated,
+        contextUsed,
+      };
+    }
+
+    // G. Timer Display Component (set time OR rundown time: broadcast, section, item)
+    if (/\b(timer|countdown|clock|stopwatch)\b/i.test(lower)) {
+      let scope: "broadcast" | "section" | "item" = "item";
+      if (lower.includes("broadcast")) scope = "broadcast";
+      else if (lower.includes("section")) scope = "section";
+      else if (lower.includes("item") || lower.includes("cue")) scope = "item";
+
+      const clockMatch = /\b(\d{1,2}):(\d{2})\b/.exec(promptText);
+      const isSetTime =
+        lower.includes("set time") ||
+        lower.includes("countdown") ||
+        (clockMatch !== null && !lower.includes("rundown"));
+      const setDurationSec = clockMatch
+        ? Number.parseInt(clockMatch[1]!, 10) * 60 + Number.parseInt(clockMatch[2]!, 10)
+        : timed.showForSec ?? 300;
+
+      const mode = isSetTime ? "set-time" : "rundown";
+      const label =
+        mode === "set-time"
+          ? `Set Timer (${Math.floor(setDurationSec / 60)}:${String(setDurationSec % 60).padStart(2, "0")})`
+          : `Rundown Timer (${scope.toUpperCase()})`;
+
+      const spec = this.ensureTargetSpec(targetScreenId);
+      const panel: UiPanelNode = {
+        type: "panel",
+        id: `panel-timer-${mode}-${scope}-${Date.now()}`,
+        title: label,
+        subtitle:
+          mode === "rundown"
+            ? `Tracking ${scope} timing (${ctx.rundown.placeInEvent ?? "Live"})`
+            : `Fixed countdown timer (${setDurationSec}s)`,
+        icon: "timer",
+        tone: "default",
+        zone: "main",
+        sourceLabel: "Timer",
+        collapsible: false,
+        collapsed: false,
+        pinned: false,
+        ...(mouse?.rect ? { rectHint: mouse.rect } : {}),
+        ...(condition ? { condition } : {}),
+        ...(timed.showForSec && !isSetTime
+          ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt }
+          : {}),
+        actions: [],
+        children: [
+          {
+            type: "component",
+            id: `comp-timer-${mode}-${scope}`,
+            component: "timer-display",
+            props: {
+              mode,
+              scope,
+              label,
+              setDurationSec: mode === "set-time" ? setDurationSec : ctx.rundown.timerSec ?? ctx.rundown.expectedDurationSec ?? 180,
+              startedAt:
+                scope === "broadcast"
+                  ? ctx.broadcastStartedAt
+                  : scope === "section"
+                    ? ctx.sectionStartedAt
+                    : ctx.itemStartedAt,
+              overtime: ctx.rundown.overtime,
+            },
+            actions: [],
+            ...(condition ? { condition } : {}),
+          },
+        ],
+      };
+
+      const updated = this.appendPanelToSpec(spec, panel, `Added ${label}`);
+      return {
+        ok: true,
+        agentId: "prompted-creator-agent",
+        intent: "screen_layout",
+        source: "deterministic-compiler",
+        targetScreenId: updated.screenId,
+        summary: `Added ${label} on ${updated.screenId}`,
+        screen: updated,
+        contextUsed,
+      };
+    }
+
+    // H. Long-Form Scrolling Document Layout switch
+    if (/\b(long\s+document|scrolling\s+document|document\s+layout|scroll\s+view)\b/i.test(lower)) {
+      const spec = this.ensureTargetSpec(targetScreenId);
+      spec.layoutMode = "document";
+      spec.updatedAt = new Date().toISOString();
+      spec.reason = `Switched to scrolling document layout: "${promptText}"`;
+      const saved = this.state.setScreenSpec(spec.screenId, spec);
+      return {
+        ok: true,
+        agentId: "prompted-creator-agent",
+        intent: "screen_layout",
+        source: "deterministic-compiler",
+        targetScreenId: saved.screenId,
+        summary: `Switched ${saved.screenId} to long scrolling document layout`,
+        screen: saved,
+        contextUsed,
+      };
+    }
+
+    // I. Last Message Refinement (e.g. when useLastMessageContext is true and user says "make it a hover" or "only show after sermon has passed" or "show for 5 minutes")
+    if (lastMsg && (condition || timed.showForSec)) {
+      const spec = this.ensureTargetSpec(targetScreenId);
+      const allPanels = spec.divisions.flatMap((d) => d.slots.flatMap((s) => s.panels));
+      const lastPanel = allPanels[allPanels.length - 1];
+      if (lastPanel && !/\b(add|create|build)\b/i.test(lower)) {
+        if (condition) lastPanel.condition = condition;
+        if (timed.showForSec) {
+          lastPanel.showForSec = timed.showForSec;
+          lastPanel.expiresAt = timed.expiresAt;
+        }
+        const saved = this.state.setScreenSpec(spec.screenId, spec);
+        return {
+          ok: true,
+          agentId: "prompted-creator-agent",
+          intent: "screen_layout",
+          source: "deterministic-compiler",
+          targetScreenId: saved.screenId,
+          summary: `Refined previous UI element on ${saved.screenId} (${promptText})`,
+          screen: saved,
+          contextUsed,
+        };
+      }
+    }
+
+    return null;
   }
 
   private async tryOllamaCompile(
     promptText: string,
     targetScreenId: string,
     durability: "persistent" | "broadcast" | undefined,
-    ctx: BroadcastContextState
+    ctx: BroadcastContextState | null,
+    mouse: MouseSelectionContext | null,
+    lastMsg: ReturnType<ComposerState["getLastMessageContext"]>,
+    contextUsed: PromptExecutionResult["contextUsed"]
   ): Promise<PromptExecutionResult | null> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -115,13 +887,13 @@ export class PromptedUiCreatorAgent {
     try {
       const system = `You are the Prompted UI Creator Agent ("ui-prompt-creator") in picomposer.
 You are NOT the broadcast director — you never switch cameras or issue shot advisories.
-You generate typed JSON UI specifications or Standing UI Rules using @piecosystem/piui layout primitives (panel, division, hover) and molecules (graphics-lower-third-panel, preflight-checklist-card, atem-bus-selector, ptz-pad, ptz-preset-card, tally-facet-widget, cue-button-group, audio-fader, rundown-item-card, stream-status-card, live-captions-feed, steering-notes-list, decision-log-list).
+You generate typed JSON UI specifications or Standing UI Rules using @piecosystem/piui layout primitives (panel, division, hover, document) and molecules (graphics-lower-third-panel, preflight-checklist-card, atem-bus-selector, ptz-pad, ptz-preset-card, tally-facet-widget, cue-button-group, audio-fader, wireless-mic-bank, macro-button, timer-display, timeseries-chart, rundown-item-card, stream-status-card, live-captions-feed, steering-notes-list, decision-log-list).
 Respond ONLY with valid JSON:
 {
   "intent": "standing_rule" | "screen_layout",
   "summary": "Human readable explanation",
-  "rule": { ...StandingUiRuleCreate... }, // when intent === "standing_rule"
-  "screen": { ...UiScreenSpec... } // when intent === "screen_layout"
+  "rule": { ...StandingUiRuleCreate... },
+  "screen": { ...UiScreenSpec... }
 }`;
 
       const res = await this.fetchFn(`${this.ollamaUrl}/api/chat`, {
@@ -139,7 +911,9 @@ Respond ONLY with valid JSON:
                 prompt: promptText,
                 targetScreenId,
                 durability: durability ?? "persistent",
-                broadcastContext: ctx,
+                ...(ctx ? { broadcastContext: ctx } : {}),
+                ...(mouse ? { mouseContext: mouse } : {}),
+                ...(lastMsg ? { lastMessageContext: lastMsg } : {}),
               }),
             },
           ],
@@ -173,13 +947,17 @@ Respond ONLY with valid JSON:
           summary: parsed.summary ?? `Created standing UI rule '${createdRule.name}'`,
           rule: createdRule,
           screen,
+          contextUsed,
         };
       }
 
       if (parsed.intent === "screen_layout" && parsed.screen) {
+        const slot = this.state.ensureScreen(targetScreenId);
         const validatedScreen = UiScreenSpecSchema.parse({
           ...parsed.screen,
           screenId: targetScreenId,
+          pageName: slot.pageName,
+          viewNumber: slot.viewNumber,
           generatedBy: "prompted-creator-agent",
           updatedAt: new Date().toISOString(),
         });
@@ -192,6 +970,7 @@ Respond ONLY with valid JSON:
           targetScreenId,
           summary: parsed.summary ?? `Generated custom layout for ${targetScreenId}`,
           screen: saved,
+          contextUsed,
         };
       }
       return null;
@@ -206,48 +985,56 @@ Respond ONLY with valid JSON:
     promptText: string,
     targetScreenId: string,
     durability: "persistent" | "broadcast",
-    ctx: BroadcastContextState
+    ctx: BroadcastContextState,
+    mouse: MouseSelectionContext | null,
+    _lastMsg: ReturnType<ComposerState["getLastMessageContext"]>,
+    contextUsed: PromptExecutionResult["contextUsed"]
   ): PromptExecutionResult {
     const lower = promptText.toLowerCase();
+    const condition = parseVisibilityConditionFromPrompt(promptText);
+    const timed = parseTimedVisibilitySec(promptText);
 
-    // Detect if the prompt is a conditional / standing rule request
-    // e.g. "Add graphics buttons here during sermon", "when in communion...", "always during prayer..."
     const isStandingRequest =
-      /\b(during|when|whenever|always|every\s+time|standing)\b/i.test(promptText);
+      /\b(during|when|whenever|always|every\s+time|standing|after\s+.*\s+passed)\b/i.test(promptText);
 
     if (isStandingRequest) {
-      let section: string | null = null;
-      if (lower.includes("sermon") || lower.includes("saarna")) {
-        section = "sermon";
-      } else if (lower.includes("prayer") || lower.includes("rukous") || lower.includes("intercession")) {
-        section = "intercession";
-      } else if (lower.includes("communion") || lower.includes("ehtoollinen")) {
-        section = "communion";
-      } else if (lower.includes("hymn") || lower.includes("virsi") || lower.includes("intro")) {
-        section = "intro";
+      let section: string | null = condition?.section ?? null;
+      if (!section) {
+        if (lower.includes("sermon") || lower.includes("saarna")) {
+          section = "sermon";
+        } else if (lower.includes("prayer") || lower.includes("rukous") || lower.includes("intercession")) {
+          section = "intercession";
+        } else if (lower.includes("communion") || lower.includes("ehtoollinen")) {
+          section = "communion";
+        } else if (lower.includes("hymn") || lower.includes("virsi") || lower.includes("intro")) {
+          section = "intro";
+        }
       }
 
+      const conditionOperator = condition?.operator ?? "during";
       const wantsHover = lower.includes("hover") || lower.includes("overlay") || lower.includes("popover");
       const wantsGraphics =
         lower.includes("graphic") || lower.includes("lower third") || lower.includes("alanimi") || lower.includes("title");
 
       const ruleName = wantsGraphics
-        ? `Graphics Controls (${section ? `during ${section}` : "Standing"})`
-        : `Custom Controls (${section ? `during ${section}` : "Standing"})`;
+        ? `Graphics Controls (${section ? `${conditionOperator} ${section}` : "Standing"})`
+        : `Custom Controls (${section ? `${conditionOperator} ${section}` : "Standing"})`;
 
       const panel: UiPanelNode = wantsGraphics
         ? {
             type: "panel",
             id: `panel-rule-graphics-${section ?? "live"}`,
             title: "Lower-Third Graphics & Titles",
-            subtitle: section ? `Auto-mounted during ${section}` : "Standing UI Rule",
+            subtitle: section ? `Auto-mounted ${conditionOperator} ${section}` : "Standing UI Rule",
             icon: "subtitles",
             tone: "standing-rule",
             zone: "main",
-            sourceLabel: `Standing Rule: ${section ?? "always"}`,
+            sourceLabel: `Standing Rule: ${conditionOperator} ${section ?? "always"}`,
             collapsible: false,
             collapsed: false,
             pinned: true,
+            ...(condition ? { condition } : {}),
+            ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
             actions: [
               {
                 id: "act-show-lower-third",
@@ -292,6 +1079,8 @@ Respond ONLY with valid JSON:
             collapsible: false,
             collapsed: false,
             pinned: true,
+            ...(condition ? { condition } : {}),
+            ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
             actions: [],
             children: [
               {
@@ -316,6 +1105,7 @@ Respond ONLY with valid JSON:
         trigger: {
           phase: "live",
           section,
+          conditionOperator,
           directorState: "any",
           audioClassification: lower.includes("music") ? "music" : "any",
         },
@@ -348,13 +1138,13 @@ Respond ONLY with valid JSON:
         intent: "standing_rule",
         source: "deterministic-compiler",
         targetScreenId,
-        summary: `Registered standing UI rule '${createdRule.name}' on ${targetScreenId}${section ? ` (trigger: section=${section})` : ""}`,
+        summary: `Registered standing UI rule '${createdRule.name}' on ${targetScreenId}${section ? ` (trigger: ${conditionOperator} ${section})` : ""}`,
         rule: createdRule,
         screen: updatedScreen,
+        contextUsed,
       };
     }
 
-    // Immediate on-demand screen layout generation (e.g. preflight, camera/tally workspace, graphics, audio)
     const slot = this.state.ensureScreen(targetScreenId, {
       managedBy: "prompted-creator-agent",
     });
@@ -366,6 +1156,8 @@ Respond ONLY with valid JSON:
       const cloned: UiScreenSpec = {
         ...preflightSpec,
         screenId: slot.screenId,
+        pageName: slot.pageName,
+        viewNumber: slot.viewNumber,
         screenName: slot.screenName,
         generatedBy: "prompted-creator-agent",
         reason: `Prompted: ${promptText}`,
@@ -379,6 +1171,7 @@ Respond ONLY with valid JSON:
         targetScreenId: slot.screenId,
         summary: `Composed Setup & Preflight workspace on ${slot.screenId}`,
         screen: cloned,
+        contextUsed,
       };
     }
 
@@ -395,6 +1188,9 @@ Respond ONLY with valid JSON:
         collapsible: false,
         collapsed: false,
         pinned: false,
+        ...(mouse?.rect ? { rectHint: mouse.rect } : {}),
+        ...(condition ? { condition } : {}),
+        ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
         actions: [
           {
             id: "act-prompt-lt-show",
@@ -406,6 +1202,8 @@ Respond ONLY with valid JSON:
               subtitle: ctx.rundown.assignedSpeaker ?? "Liturgi",
             },
             variant: "primary",
+            ...(condition ? { condition } : {}),
+            ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
           },
         ],
         children: [
@@ -436,6 +1234,9 @@ Respond ONLY with valid JSON:
         collapsible: false,
         collapsed: false,
         pinned: false,
+        ...(mouse?.rect ? { rectHint: mouse.rect } : {}),
+        ...(condition ? { condition } : {}),
+        ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
         actions: [],
         children: [
           {
@@ -469,6 +1270,8 @@ Respond ONLY with valid JSON:
         collapsible: false,
         collapsed: false,
         pinned: false,
+        ...(condition ? { condition } : {}),
+        ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
         actions: [],
         children: [
           {
@@ -495,6 +1298,8 @@ Respond ONLY with valid JSON:
         collapsible: false,
         collapsed: false,
         pinned: false,
+        ...(condition ? { condition } : {}),
+        ...(timed.showForSec ? { showForSec: timed.showForSec, expiresAt: timed.expiresAt } : {}),
         actions: [],
         children: [
           {
@@ -516,10 +1321,16 @@ Respond ONLY with valid JSON:
     }
 
     const matchingRules = this.rulesStore.getMatchingRules(ctx, slot.screenId);
+    const layoutMode =
+      /\b(document|scroll)\b/i.test(lower) ? "document" : slot.spec?.layoutMode ?? "grid";
+
     const screenSpec: UiScreenSpec = {
       screenId: slot.screenId,
+      pageName: slot.pageName,
+      viewNumber: slot.viewNumber,
       screenName: slot.screenName,
       role: slot.role,
+      layoutMode,
       generatedBy: "prompted-creator-agent",
       updatedAt: new Date().toISOString(),
       reason: `Prompted: ${promptText}`,
@@ -531,6 +1342,7 @@ Respond ONLY with valid JSON:
         placeInEvent: ctx.rundown.placeInEvent,
         activeSection: ctx.rundown.currentSection,
         activeSubsection: ctx.rundown.currentSubsection,
+        completedSections: [...ctx.rundown.completedSections],
         timingSummary: ctx.rundown.timingSummary,
         nextItemTitle: ctx.rundown.nextItem?.title ?? null,
         programInput: ctx.hardware.programInput,
@@ -541,8 +1353,8 @@ Respond ONLY with valid JSON:
         {
           type: "division",
           id: "div-prompted-workspace",
-          direction: "grid",
-          columns: panels.length > 1 ? 2 : 1,
+          direction: layoutMode === "document" ? "vertical" : "grid",
+          columns: layoutMode === "document" ? 1 : panels.length > 1 ? 2 : 1,
           gap: "md",
           divided: false,
           slots: panels.map((p, idx) => ({
@@ -564,6 +1376,7 @@ Respond ONLY with valid JSON:
       targetScreenId: slot.screenId,
       summary: `Composed ${panels.length} panel(s) on ${slot.screenId} for prompt: "${promptText}"`,
       screen: saved,
+      contextUsed,
     };
   }
 }

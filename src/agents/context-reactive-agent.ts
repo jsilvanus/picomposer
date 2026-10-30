@@ -23,7 +23,7 @@ export interface ContextReactiveAgentOptions {
  * - pidirector directing (autonomous mode -> active shot rationale, prepared preview, preempt/steering)
  * - Operator manual action / preemption (manual mode -> manual camera/switcher controls + Continue AI)
  * - Broadcast phase (composer-driven Setup & Preflight checklist when idle/ready; post-broadcast archive when complete)
- * - Active Standing UI Rules (e.g. mounting lower-third graphics buttons during the sermon)
+ * - Active Standing UI Rules (e.g. mounting lower-third graphics buttons during or after the sermon)
  */
 export class ContextReactiveUiAgent {
   private readonly state: ComposerState;
@@ -45,7 +45,6 @@ export class ContextReactiveUiAgent {
       if (slot.managedBy === "context-reactive-agent") {
         updated.push(this.composeScreen(slot.screenId, reason));
       } else if (slot.spec) {
-        // Re-apply standing rules to prompted screens as well so standing rules targeting screen-2 work seamlessly
         updated.push(this.refreshStandingRulesOnScreen(slot.screenId, slot.spec, reason));
       } else {
         updated.push(this.composeDefaultOperatorWorkspace(slot.screenId, reason));
@@ -61,8 +60,8 @@ export class ContextReactiveUiAgent {
 
     const spec =
       slot.role === "preflight"
-        ? this.buildPreflightScreenSpec(slot.screenId, slot.screenName, ctx, matchingRules, reason)
-        : this.buildCopilotScreenSpec(slot.screenId, slot.screenName, ctx, matchingRules, reason);
+        ? this.buildPreflightScreenSpec(slot, ctx, matchingRules, reason)
+        : this.buildCopilotScreenSpec(slot, ctx, matchingRules, reason);
 
     this.state.setScreenSpec(slot.screenId, spec);
     this.eventBroker?.emit({
@@ -85,6 +84,7 @@ export class ContextReactiveUiAgent {
       placeInEvent: ctx.rundown.placeInEvent,
       activeSection: ctx.rundown.currentSection,
       activeSubsection: ctx.rundown.currentSubsection ?? ctx.rundown.currentCueTitle,
+      completedSections: [...ctx.rundown.completedSections],
       timingSummary: ctx.rundown.timingSummary,
       nextItemTitle: ctx.rundown.nextItem?.title ?? null,
       programInput: ctx.hardware.programInput,
@@ -187,8 +187,7 @@ export class ContextReactiveUiAgent {
   }
 
   private buildCopilotScreenSpec(
-    screenId: string,
-    screenName: string,
+    slot: { screenId: string; pageName: string; viewNumber: number; screenName: string; spec: UiScreenSpec | null },
     ctx: BroadcastContextState,
     matchingRules: StandingUiRule[],
     reason: string
@@ -200,12 +199,10 @@ export class ContextReactiveUiAgent {
     const bottomPanels: UiPanelNode[] = [];
     const hovers: UiHoverNode[] = [];
 
-    // 1. If in preflight phase, include the composer-driven preflight flow at the top
     if (ctx.phase === "preflight") {
       topPanels.push(this.buildPreflightPanel(ctx));
     }
 
-    // 2. React to pidirector state: Advisory vs Autonomous Directing vs Operator Manual Override
     const adv = ctx.director.pendingAdvisory;
     if (ctx.director.mode === "advisory" && adv) {
       const targetCam = adv.prepareCamera?.camera ?? adv.cutToInput ?? ctx.hardware.previewInput;
@@ -370,7 +367,6 @@ export class ContextReactiveUiAgent {
         ],
       });
     } else {
-      // Manual mode / operator override
       const opAct = ctx.director.lastOperatorAction;
       const focusCam = opAct?.targetCamera ?? opAct?.targetInput ?? ctx.hardware.programInput;
       mainLeftPanels.push({
@@ -441,7 +437,6 @@ export class ContextReactiveUiAgent {
       });
     }
 
-    // 3. Right column: Rundown situational awareness + Steering notes + Decision log
     mainRightPanels.push({
       type: "panel",
       id: "panel-rundown-context",
@@ -518,7 +513,6 @@ export class ContextReactiveUiAgent {
       ],
     });
 
-    // 4. Inject matching Standing UI Rules (e.g. "Add graphics buttons here during sermon")
     this.injectStandingRules(
       matchingRules,
       ctx,
@@ -564,9 +558,12 @@ export class ContextReactiveUiAgent {
     }
 
     return {
-      screenId,
-      screenName,
+      screenId: slot.screenId,
+      pageName: slot.pageName,
+      viewNumber: slot.viewNumber,
+      screenName: slot.screenName,
       role: "copilot",
+      layoutMode: slot.spec?.layoutMode ?? "grid",
       generatedBy: "context-reactive-agent",
       updatedAt: now,
       reason,
@@ -580,8 +577,7 @@ export class ContextReactiveUiAgent {
   }
 
   private buildPreflightScreenSpec(
-    screenId: string,
-    screenName: string,
+    slot: { screenId: string; pageName: string; viewNumber: number; screenName: string; spec: UiScreenSpec | null },
     ctx: BroadcastContextState,
     matchingRules: StandingUiRule[],
     reason: string
@@ -657,9 +653,12 @@ export class ContextReactiveUiAgent {
     );
 
     return {
-      screenId,
-      screenName,
+      screenId: slot.screenId,
+      pageName: slot.pageName,
+      viewNumber: slot.viewNumber,
+      screenName: slot.screenName,
       role: "preflight",
+      layoutMode: slot.spec?.layoutMode ?? "grid",
       generatedBy: "context-reactive-agent",
       updatedAt: now,
       reason,
@@ -704,7 +703,7 @@ export class ContextReactiveUiAgent {
         type: "panel",
         id: "panel-operator-switcher",
         title: "Switcher & Camera Control",
-        subtitle: "Prompt the UI Creator Agent to customize this screen or add standing rules",
+        subtitle: "Prompt the UI Creator Agent (@ai) to customize this view or add standing rules",
         icon: "videocam",
         tone: "default",
         zone: "main",
@@ -738,8 +737,11 @@ export class ContextReactiveUiAgent {
 
     const spec: UiScreenSpec = {
       screenId: slot.screenId,
+      pageName: slot.pageName,
+      viewNumber: slot.viewNumber,
       screenName: slot.screenName,
       role: slot.role,
+      layoutMode: slot.spec?.layoutMode ?? "grid",
       generatedBy: "prompted-creator-agent",
       updatedAt: new Date().toISOString(),
       reason,
@@ -778,7 +780,6 @@ export class ContextReactiveUiAgent {
     const ctx = this.state.getContext();
     const matchingRules = this.rulesStore.getMatchingRules(ctx, screenId);
 
-    // Strip previously injected standing-rule panels/hovers and re-inject currently matching ones
     const cleanedDivisions: UiDivisionNode[] = existing.divisions.map((div) => ({
       ...div,
       slots: div.slots.map((slot) => ({
@@ -861,7 +862,6 @@ export class ContextReactiveUiAgent {
           sourceLabel: rule.panel.sourceLabel ?? `Standing Rule: ${rule.name}`,
         };
 
-        // Enrich lower-third graphics panels with live speaker/cue context from pirundown
         for (const child of panel.children) {
           if (child.component === "graphics-lower-third-panel") {
             child.props = {

@@ -1,3 +1,4 @@
+import path from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
 import { ContextReactiveUiAgent } from "./agents/context-reactive-agent.js";
 import { PromptedUiCreatorAgent } from "./agents/prompted-creator-agent.js";
@@ -32,9 +33,10 @@ export function buildApp(
   });
 
   const eventBroker = new ComposerEventBroker();
-  const state = new ComposerState(eventBroker);
+  const rulesFile = options?.standingRulesFile ?? config.standingRulesFile;
+  const state = new ComposerState(eventBroker, path.dirname(path.resolve(rulesFile)));
   const rulesStore = new StandingRulesStore({
-    filePath: options?.standingRulesFile ?? config.standingRulesFile,
+    filePath: rulesFile,
     eventBroker,
   });
 

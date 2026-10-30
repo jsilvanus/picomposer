@@ -225,3 +225,242 @@ test("PromptedUiCreatorAgent: compiles standing UI rules ('Add graphics buttons 
 
   await app.close();
 });
+
+test("Multi-screen named pages & numbered views (/gui/:name/:number), UI editing dialog, context chips, mouse context, conditionals, macros, charts, timers, and saved components", async (t) => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "picomposer-gui-"));
+  t.after(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  const config = loadConfig({
+    PICOMPOSER_RULES_FILE: path.join(tmpDir, "standing-rules.json"),
+  });
+  const { app } = buildApp(config);
+  await app.ready();
+
+  // 1. Default /gui and /gui/1/1 render permanent #btn-ui-edit, non-modal <dialog id="ai-prompt-dialog" popover="manual">, and 3 context chips
+  const guiDefaultRes = await app.inject({ method: "GET", url: "/gui" });
+  assert.equal(guiDefaultRes.statusCode, 200);
+  const guiHtml = guiDefaultRes.body;
+  assert.ok(guiHtml.includes('id="btn-ui-edit"'));
+  assert.ok(guiHtml.includes('<dialog id="ai-prompt-dialog" popover="manual"'));
+  assert.ok(guiHtml.includes('id="chip-broadcast-ctx"'));
+  assert.ok(guiHtml.includes('id="chip-mouse-ctx"'));
+  assert.ok(guiHtml.includes('id="chip-last-msg-ctx"'));
+
+  // 2. Named pages with numbered views: e.g. John can have 3 views (/gui/john/1, /gui/john/2, /gui/john/3)
+  for (const num of [1, 2, 3]) {
+    const res = await app.inject({ method: "GET", url: `/gui/john/${num}` });
+    assert.equal(res.statusCode, 200);
+    assert.ok(res.body.includes(`data-page-name="john"`));
+    assert.ok(res.body.includes(`data-view-number="${num}"`));
+  }
+
+  const pagesRes = await app.inject({ method: "GET", url: "/api/v1/pages" });
+  assert.equal(pagesRes.statusCode, 200);
+  const johnPage = pagesRes.json().pages.find((p: any) => p.pageName === "john");
+  assert.ok(johnPage);
+  assert.equal(johnPage.views.length, 3);
+  assert.deepEqual(
+    johnPage.views.map((v: any) => v.viewNumber),
+    [1, 2, 3]
+  );
+
+  // 3. Draw a rectangle on /gui/john/1 and prompt "add here sound controls for wireless mics 1,2,5"
+  await app.inject({
+    method: "POST",
+    url: "/api/v1/context/mouse",
+    payload: {
+      mode: "rectangle",
+      pageName: "john",
+      viewNumber: 1,
+      rect: { x: 120, y: 80, width: 360, height: 220 },
+    },
+  });
+
+  const micsRes = await app.inject({
+    method: "POST",
+    url: "/api/v1/prompt",
+    payload: {
+      prompt: "add here sound controls for wireless mics 1,2,5",
+      pageName: "john",
+      viewNumber: 1,
+      useBroadcastContext: true,
+      useMouseContext: true,
+    },
+  });
+  assert.equal(micsRes.statusCode, 200);
+  const micsJson = micsRes.json();
+  assert.equal(micsJson.contextUsed.mouse, true);
+  const john1Panels = micsJson.screen.divisions[0].slots[0].panels;
+  const micPanel = john1Panels.find((p: any) => p.id === "panel-wireless-mics-1-2-5");
+  assert.ok(micPanel);
+  assert.deepEqual(micPanel.rectHint, { x: 120, y: 80, width: 360, height: 220 });
+  assert.equal(micPanel.children[0].component, "wireless-mic-bank");
+  assert.equal(micPanel.children[0].props.channels.length, 3);
+
+  // 4. Save selected objects as a named UI component: "save these as sermon controls"
+  await app.inject({
+    method: "POST",
+    url: "/api/v1/context/mouse",
+    payload: {
+      mode: "rectangle",
+      pageName: "john",
+      viewNumber: 1,
+      rect: { x: 100, y: 50, width: 400, height: 300 },
+      overlappingPanelIds: ["panel-wireless-mics-1-2-5"],
+    },
+  });
+
+  const saveRes = await app.inject({
+    method: "POST",
+    url: "/api/v1/prompt",
+    payload: {
+      prompt: "save these as sermon controls",
+      pageName: "john",
+      viewNumber: 1,
+      useMouseContext: true,
+    },
+  });
+  assert.equal(saveRes.statusCode, 200);
+  assert.equal(saveRes.json().intent, "save_component");
+  assert.equal(saveRes.json().savedComponent.slug, "sermon-controls");
+
+  // Mount the saved component onto /gui/john/2
+  const insertRes = await app.inject({
+    method: "POST",
+    url: "/api/v1/prompt",
+    payload: {
+      prompt: "insert sermon controls",
+      pageName: "john",
+      viewNumber: 2,
+    },
+  });
+  assert.equal(insertRes.statusCode, 200);
+  const john2Panels = insertRes.json().screen.divisions[0].slots[0].panels;
+  assert.ok(john2Panels.some((p: any) => p.savedComponentName === "sermon controls"));
+
+  // 5. Highlight a component with mouse and say "Remove this"
+  await app.inject({
+    method: "POST",
+    url: "/api/v1/context/mouse",
+    payload: {
+      mode: "component",
+      pageName: "john",
+      viewNumber: 1,
+      componentId: "comp-fader-mic-5",
+      panelId: "panel-wireless-mics-1-2-5",
+    },
+  });
+
+  const removeRes = await app.inject({
+    method: "POST",
+    url: "/api/v1/prompt",
+    payload: {
+      prompt: "Remove this",
+      pageName: "john",
+      viewNumber: 1,
+      useMouseContext: true,
+    },
+  });
+  assert.equal(removeRes.statusCode, 200);
+  assert.equal(removeRes.json().intent, "modify_selection");
+  const updatedMicPanel = removeRes
+    .json()
+    .screen.divisions[0].slots[0].panels.find((p: any) => p.id === "panel-wireless-mics-1-2-5");
+  assert.ok(!updatedMicPanel.children.some((c: any) => c.id === "comp-fader-mic-5"));
+
+  // 6. Macro button + Timed visibility ("show for 5 minutes") + Conditional ("show only after sermon has passed")
+  const macroRes = await app.inject({
+    method: "POST",
+    url: "/api/v1/prompt",
+    payload: {
+      prompt:
+        "Add a button that turns off graphics and fades to black, show for 5 minutes, show only after sermon has passed",
+      pageName: "john",
+      viewNumber: 3,
+    },
+  });
+  assert.equal(macroRes.statusCode, 200);
+  const macroPanel = macroRes
+    .json()
+    .screen.divisions[0].slots[0].panels.find((p: any) => p.id.startsWith("panel-macro-"));
+  assert.ok(macroPanel);
+  assert.equal(macroPanel.showForSec, 300);
+  assert.ok(macroPanel.expiresAt);
+  assert.deepEqual(macroPanel.condition, { operator: "after", section: "sermon" });
+  assert.equal(macroPanel.children[0].component, "macro-button");
+  assert.equal(macroPanel.children[0].props.steps.length, 2);
+
+  // Before sermon has passed, the conditional panel is rendered with `hidden data-conditional-hidden="true"` in /gui/john/3
+  const beforeSermonPassedHtml = (await app.inject({ method: "GET", url: "/gui/john/3" })).body;
+  assert.ok(beforeSermonPassedHtml.includes('hidden data-conditional-hidden="true"'));
+
+  // Advance rundown to Saarna and then past Saarna to Ehtoollinen
+  await app.inject({
+    method: "POST",
+    url: "/api/v1/ingest/event",
+    payload: {
+      type: "rundown",
+      data: { currentSection: "Saarna", currentCueId: "saarna", currentCueTitle: "Saarna" },
+    },
+  });
+  await app.inject({
+    method: "POST",
+    url: "/api/v1/ingest/event",
+    payload: {
+      type: "rundown",
+      data: {
+        currentSection: "Ehtoollinen",
+        currentCueId: "ehtoollinen",
+        currentCueTitle: "Ehtoollisrukous",
+      },
+    },
+  });
+
+  // Now that sermon has passed, the panel is visible (not hidden)!
+  const afterSermonPassedHtml = (await app.inject({ method: "GET", url: "/gui/john/3" })).body;
+  assert.ok(!afterSermonPassedHtml.includes('hidden data-conditional-hidden="true"'));
+
+  // 7. Time-series chart + Rundown timer + Long scrolling document layout
+  const chartRes = await app.inject({
+    method: "POST",
+    url: "/api/v1/prompt",
+    payload: {
+      prompt: "Add a time series chart of caption lag",
+      pageName: "john",
+      viewNumber: 3,
+    },
+  });
+  assert.equal(chartRes.statusCode, 200);
+
+  const timerRes = await app.inject({
+    method: "POST",
+    url: "/api/v1/prompt",
+    payload: {
+      prompt: "Add a rundown timer for section",
+      pageName: "john",
+      viewNumber: 3,
+    },
+  });
+  assert.equal(timerRes.statusCode, 200);
+
+  const docRes = await app.inject({
+    method: "POST",
+    url: "/api/v1/prompt",
+    payload: {
+      prompt: "Switch to long scrolling document layout",
+      pageName: "john",
+      viewNumber: 3,
+    },
+  });
+  assert.equal(docRes.statusCode, 200);
+  assert.equal(docRes.json().screen.layoutMode, "document");
+
+  const docGuiHtml = (await app.inject({ method: "GET", url: "/gui/john/3" })).body;
+  assert.ok(docGuiHtml.includes("piui-document-layout"));
+  assert.ok(docGuiHtml.includes("gui-timeseries-chart"));
+  assert.ok(docGuiHtml.includes("gui-timer-display"));
+
+  await app.close();
+});

@@ -1,11 +1,16 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 import type { ContextReactiveUiAgent } from "./agents/context-reactive-agent.js";
 import type { PromptedUiCreatorAgent } from "./agents/prompted-creator-agent.js";
 import type { ComposerEventBroker } from "./events.js";
+import { renderGuiPageHtml } from "./gui/render-gui.js";
 import type { EcosystemIngestor } from "./ingest/ecosystem-ingestor.js";
 import type { StandingRulesStore } from "./rules/standing-rules-store.js";
-import { StandingUiRuleCreateSchema } from "./schema/ui-schema.js";
+import {
+  StandingUiRuleCreateSchema,
+  TimeSeriesMetricSchema,
+  UiScreenRectSchema,
+} from "./schema/ui-schema.js";
 import type { ComposerState } from "./state/composer-state.js";
 
 export interface RouteDependencies {
@@ -20,13 +25,46 @@ export interface RouteDependencies {
 export function registerRoutes(app: FastifyInstance, deps: RouteDependencies): void {
   const { state, rulesStore, reactiveAgent, creatorAgent, ingestor, eventBroker } = deps;
 
+  function serveGuiView(name: string | undefined, number: string | undefined, reply: FastifyReply) {
+    const slot = state.ensurePageView(name ?? "1", number ?? "1");
+    if (!slot.spec) {
+      if (slot.managedBy === "context-reactive-agent") {
+        reactiveAgent.composeScreen(slot.screenId, "initial_gui_load");
+      } else {
+        reactiveAgent.composeDefaultOperatorWorkspace(slot.screenId, "initial_gui_load");
+      }
+    }
+    const spec = state.getScreen(slot.screenId)!.spec!;
+    const html = renderGuiPageHtml({
+      spec,
+      context: state.getContext(),
+      mouseContext: state.getMouseContext(),
+      lastMessageContext: state.getLastMessageContext(),
+      pages: state.listPages(),
+      savedComponentNames: state.savedComponentsStore.list().map((c) => c.name),
+    });
+    return reply.type("text/html; charset=utf-8").send(html);
+  }
+
+  // Multi-screen generative UI routes: /gui, /gui/:name, /gui/:name/:number (with :name default to 1, :number default to 1)
+  app.get("/gui", async (_request, reply) => serveGuiView("1", "1", reply));
+  app.get<{ Params: { name: string } }>("/gui/:name", async (request, reply) =>
+    serveGuiView(request.params.name, "1", reply)
+  );
+  app.get<{ Params: { name: string; number: string } }>(
+    "/gui/:name/:number",
+    async (request, reply) => serveGuiView(request.params.name, request.params.number, reply)
+  );
+
   app.get("/health", async () => {
     return {
       status: "ok",
       service: "picomposer",
       phase: state.getContext().phase,
       screensCount: state.listScreens().length,
+      pagesCount: state.listPages().length,
       standingRulesCount: rulesStore.getAll().length,
+      savedComponentsCount: state.savedComponentsStore.list().length,
       time: new Date().toISOString(),
     };
   });
@@ -46,9 +84,9 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDependencies): v
           id: "prompted-creator-agent",
           piagentId: "ui-prompt-creator",
           name: "Prompted UI & Standing Rules Creator",
-          role: "On-demand UI workspace builder and standing-rule author prompted by the operator. Knows full broadcast state and @piecosystem/piui catalog, but is NOT the broadcast director.",
+          role: "On-demand UI workspace builder and standing-rule author prompted by the operator. Knows full broadcast state, mouse context, last message context, and @piecosystem/piui catalog, but is NOT the broadcast director.",
           isBroadcastDirector: false,
-          managedScreens: ["screen-2 (operator)", "custom screens", "standing UI rules"],
+          managedScreens: ["screen-2 (operator)", "custom named pages & views", "standing UI rules"],
         },
       ],
     };
@@ -58,9 +96,141 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDependencies): v
     return {
       service: "picomposer",
       context: state.getContext(),
+      mouseContext: state.getMouseContext(),
+      lastMessageContext: state.getLastMessageContext(),
       standingRules: rulesStore.getAll(),
+      savedComponents: state.savedComponentsStore.list(),
+      pages: state.listPages(),
       screens: state.listScreens(),
     };
+  });
+
+  app.get("/api/v1/pages", async () => {
+    return {
+      pages: state.listPages(),
+    };
+  });
+
+  app.get<{ Params: { name: string; number: string } }>(
+    "/api/v1/pages/:name/:number",
+    async (request) => {
+      const slot = state.ensurePageView(request.params.name, request.params.number);
+      if (!slot.spec) {
+        if (slot.managedBy === "context-reactive-agent") {
+          reactiveAgent.composeScreen(slot.screenId, "page_view_load");
+        } else {
+          reactiveAgent.composeDefaultOperatorWorkspace(slot.screenId, "page_view_load");
+        }
+      }
+      return {
+        pageName: slot.pageName,
+        viewNumber: slot.viewNumber,
+        screen: state.getScreen(slot.screenId),
+      };
+    }
+  );
+
+  // Mouse Selection Context endpoints (for /gui/:name/:number and picomposer-mcp)
+  app.get("/api/v1/context/mouse", async () => {
+    return {
+      mouseContext: state.getMouseContext(),
+    };
+  });
+
+  app.post("/api/v1/context/mouse", async (request, reply) => {
+    const schema = z.object({
+      mode: z.enum(["none", "component", "rectangle"]),
+      pageName: z.string().optional(),
+      viewNumber: z.number().int().min(1).optional(),
+      componentId: z.string().optional(),
+      componentType: z.string().optional(),
+      panelId: z.string().optional(),
+      label: z.string().optional(),
+      rect: UiScreenRectSchema.optional(),
+      overlappingComponentIds: z.array(z.string()).optional(),
+      overlappingPanelIds: z.array(z.string()).optional(),
+    });
+    const parsed = schema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: "Invalid mouse context payload",
+        details: parsed.error.format(),
+      });
+    }
+    const updated = state.setMouseContext(parsed.data);
+    return {
+      ok: true,
+      mouseContext: updated,
+    };
+  });
+
+  app.delete("/api/v1/context/mouse", async () => {
+    const cleared = state.clearMouseContext();
+    return {
+      ok: true,
+      mouseContext: cleared,
+    };
+  });
+
+  app.get("/api/v1/context/last-message", async () => {
+    return {
+      lastMessageContext: state.getLastMessageContext(),
+    };
+  });
+
+  app.get("/api/v1/context/broadcast", async () => {
+    return {
+      broadcastContext: state.getContext(),
+    };
+  });
+
+  // Saved Named UI Components
+  app.get("/api/v1/components/saved", async () => {
+    return {
+      components: state.savedComponentsStore.list(),
+    };
+  });
+
+  app.delete<{ Params: { slug: string } }>("/api/v1/components/saved/:slug", async (request, reply) => {
+    const ok = state.savedComponentsStore.remove(request.params.slug);
+    if (!ok) {
+      return reply.code(404).send({ error: `Saved component '${request.params.slug}' not found` });
+    }
+    return { ok: true };
+  });
+
+  // Time-series Telemetry
+  app.get("/api/v1/timeseries", async () => {
+    return {
+      series: state.timeSeriesStore.listAll(),
+    };
+  });
+
+  app.get<{ Params: { metric: string }; Querystring: { windowSec?: string } }>(
+    "/api/v1/timeseries/:metric",
+    async (request, reply) => {
+      const parsedMetric = TimeSeriesMetricSchema.safeParse(request.params.metric);
+      if (!parsedMetric.success) {
+        return reply.code(400).send({ error: `Unknown metric '${request.params.metric}'` });
+      }
+      const windowSec = request.query.windowSec ? Number(request.query.windowSec) : undefined;
+      return {
+        series: state.timeSeriesStore.getSeries(parsedMetric.data, windowSec),
+      };
+    }
+  );
+
+  app.post<{ Params: { metric: string } }>("/api/v1/timeseries/:metric", async (request, reply) => {
+    const parsedMetric = TimeSeriesMetricSchema.safeParse(request.params.metric);
+    if (!parsedMetric.success) {
+      return reply.code(400).send({ error: `Unknown metric '${request.params.metric}'` });
+    }
+    const body = (request.body ?? {}) as { value?: number; ts?: string };
+    if (typeof body.value !== "number") {
+      return reply.code(400).send({ error: "Numeric 'value' is required" });
+    }
+    const pt = state.timeSeriesStore.record(parsedMetric.data, body.value, body.ts);
+    return { ok: true, point: pt };
   });
 
   app.get("/api/v1/events", (request, reply) => {
@@ -127,7 +297,12 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDependencies): v
     const schema = z.object({
       prompt: z.string().min(1),
       targetScreenId: z.string().optional(),
+      pageName: z.string().optional(),
+      viewNumber: z.number().int().min(1).optional(),
       durability: z.enum(["persistent", "broadcast"]).optional(),
+      useBroadcastContext: z.boolean().optional(),
+      useMouseContext: z.boolean().optional(),
+      useLastMessageContext: z.boolean().optional(),
     });
     const parsed = schema.safeParse(request.body);
     if (!parsed.success) {

@@ -1,10 +1,11 @@
 import { EventEmitter } from "node:events";
-import type { StandingUiRule, UiScreenSpec } from "./schema/ui-schema.js";
+import type { MouseSelectionContext, StandingUiRule, UiScreenSpec } from "./schema/ui-schema.js";
 
 export type ComposerEvent =
   | { type: "ready"; data: { status: string; screens: string[]; time: string } }
   | { type: "screen-updated"; data: UiScreenSpec }
   | { type: "standing-rules-updated"; data: { rules: StandingUiRule[] } }
+  | { type: "context-updated"; data: { mouseContext: MouseSelectionContext } }
   | {
       type: "agent-turn";
       data: {

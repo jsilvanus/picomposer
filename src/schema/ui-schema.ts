@@ -9,9 +9,41 @@ export type DirectorMode = z.infer<typeof DirectorModeSchema>;
 export const ScreenRoleSchema = z.enum(["copilot", "operator", "preflight", "custom"]);
 export type ScreenRole = z.infer<typeof ScreenRoleSchema>;
 
+export const LayoutModeSchema = z.enum(["grid", "document"]);
+export type LayoutMode = z.infer<typeof LayoutModeSchema>;
+
+export const TimeSeriesMetricSchema = z.enum([
+  "audio_rms_dbfs",
+  "caption_lag_ms",
+  "shot_dwell_sec",
+  "stream_bitrate_kbps",
+  "camera_motion_speed",
+]);
+export type TimeSeriesMetric = z.infer<typeof TimeSeriesMetricSchema>;
+
+export const UiScreenRectSchema = z.object({
+  x: z.number(),
+  y: z.number(),
+  width: z.number(),
+  height: z.number(),
+});
+export type UiScreenRect = z.infer<typeof UiScreenRectSchema>;
+
 /**
- * Typed Action Bindings for UI components.
- * Maps button presses and controls to ecosystem APIs / MCP tools.
+ * Conditional visibility for panels and components:
+ * e.g. "show only after sermon has passed" -> { operator: "after", section: "sermon" }
+ */
+export const UiVisibilityConditionSchema = z.object({
+  operator: z.enum(["always", "before", "during", "after", "not_during"]).default("always"),
+  section: z.string().nullable().optional(),
+  subsection: z.string().nullable().optional(),
+  cueId: z.string().nullable().optional(),
+  phase: z.enum(["preflight", "live", "post", "always"]).optional(),
+});
+export type UiVisibilityCondition = z.infer<typeof UiVisibilityConditionSchema>;
+
+/**
+ * Typed Action Bindings for UI components and multi-step Macros.
  */
 export const UiActionTypeSchema = z.enum([
   "director.acceptAdvisory",
@@ -23,11 +55,18 @@ export const UiActionTypeSchema = z.enum([
   "director.toggleNote",
   "director.dumpBroadcast",
   "atem.cut",
+  "atem.cutInput",
   "atem.preview",
   "atem.auto",
+  "atem.ftb",
   "camera.preset",
   "camera.move",
   "graphics.lowerThird",
+  "pipgm.blackout",
+  "sound.fader",
+  "sound.mute",
+  "audio.mute",
+  "audio.muteAll",
   "pitube.select",
   "pitube.create",
   "pitube.start",
@@ -35,23 +74,38 @@ export const UiActionTypeSchema = z.enum([
   "rundown.next",
   "tally.cue",
   "voice.captureStart",
+  "macro.execute",
 ]);
 export type UiActionType = z.infer<typeof UiActionTypeSchema>;
+
+export const UiMacroStepSchema = z.object({
+  id: z.string().optional(),
+  action: UiActionTypeSchema,
+  params: z.record(z.string(), z.unknown()).default({}),
+  label: z.string().optional(),
+  delayMs: z.number().nonnegative().optional(),
+});
+export type UiMacroStep = z.infer<typeof UiMacroStepSchema>;
 
 export const UiActionBindingSchema = z.object({
   id: z.string(),
   label: z.string(),
   action: UiActionTypeSchema,
   params: z.record(z.string(), z.unknown()).default({}),
+  steps: z.array(UiMacroStepSchema).optional(),
   variant: z
     .enum(["primary", "secondary", "danger", "ghost", "surface-high", "atem-pgm", "atem-pvw"])
     .default("primary"),
   icon: z.string().optional(),
+  condition: UiVisibilityConditionSchema.optional(),
+  showForSec: z.number().positive().optional(),
+  expiresAt: z.string().optional(),
 });
 export type UiActionBinding = z.infer<typeof UiActionBindingSchema>;
+export type UiActionButton = UiActionBinding;
 
 /**
- * Typed PiUI Component Nodes (Atoms & Molecules inside Panels / Divisions / Hovers)
+ * Typed PiUI Component Nodes (Atoms & Molecules inside Panels / Divisions / Documents / Hovers)
  */
 export const UiComponentKindSchema = z.enum([
   "director-advisory-card",
@@ -65,12 +119,16 @@ export const UiComponentKindSchema = z.enum([
   "tally-facet-widget",
   "cue-button-group",
   "audio-fader",
+  "wireless-mic-bank",
   "rundown-item-card",
   "stream-status-card",
   "live-captions-feed",
   "steering-notes-list",
   "decision-log-list",
   "action-button-group",
+  "macro-button",
+  "timer-display",
+  "timeseries-chart",
   "stat-grid",
 ]);
 export type UiComponentKind = z.infer<typeof UiComponentKindSchema>;
@@ -81,6 +139,9 @@ export const UiComponentNodeSchema = z.object({
   component: UiComponentKindSchema,
   props: z.record(z.string(), z.unknown()).default({}),
   actions: z.array(UiActionBindingSchema).default([]),
+  condition: UiVisibilityConditionSchema.optional(),
+  showForSec: z.number().positive().optional(),
+  expiresAt: z.string().optional(),
 });
 export type UiComponentNode = z.infer<typeof UiComponentNodeSchema>;
 
@@ -98,7 +159,7 @@ export const PanelZoneSchema = z.enum(["top", "main", "sidebar", "bottom", "over
 export type PanelZone = z.infer<typeof PanelZoneSchema>;
 
 /**
- * Layout Node: Panel (container card with header, tone, source badge, and child components)
+ * Layout Node: Panel
  */
 export const UiPanelNodeSchema = z.object({
   type: z.literal("panel").default("panel"),
@@ -110,9 +171,15 @@ export const UiPanelNodeSchema = z.object({
   zone: PanelZoneSchema.default("main"),
   sourceLabel: z.string().optional(),
   ruleId: z.string().optional(),
+  savedComponentSlug: z.string().optional(),
+  savedComponentName: z.string().optional(),
   collapsible: z.boolean().default(false),
   collapsed: z.boolean().default(false),
   pinned: z.boolean().default(false),
+  condition: UiVisibilityConditionSchema.optional(),
+  showForSec: z.number().positive().optional(),
+  expiresAt: z.string().optional(),
+  rectHint: UiScreenRectSchema.optional(),
   actions: z.array(UiActionBindingSchema).default([]),
   children: z.array(UiComponentNodeSchema).default([]),
 });
@@ -158,18 +225,24 @@ export const UiHoverNodeSchema = z.object({
   dismissible: z.boolean().default(true),
   pinned: z.boolean().default(false),
   autoHideSec: z.number().positive().optional(),
+  condition: UiVisibilityConditionSchema.optional(),
+  showForSec: z.number().positive().optional(),
+  expiresAt: z.string().optional(),
   actions: z.array(UiActionBindingSchema).default([]),
   children: z.array(UiComponentNodeSchema).default([]),
 });
 export type UiHoverNode = z.infer<typeof UiHoverNodeSchema>;
 
 /**
- * Top-Level Multi-Screen Specification (Typed JSON output of picomposer)
+ * Top-Level Multi-Screen View Specification (Named Page + Numbered View, e.g. /gui/john/1)
  */
 export const UiScreenSpecSchema = z.object({
   screenId: z.string(),
+  pageName: z.string().default("1"),
+  viewNumber: z.number().int().positive().default(1),
   screenName: z.string(),
   role: ScreenRoleSchema,
+  layoutMode: LayoutModeSchema.default("grid"),
   generatedBy: z.enum(["context-reactive-agent", "prompted-creator-agent", "hybrid"]),
   updatedAt: z.string(),
   reason: z.string(),
@@ -181,6 +254,7 @@ export const UiScreenSpecSchema = z.object({
     placeInEvent: z.string().nullable(),
     activeSection: z.string().nullable(),
     activeSubsection: z.string().nullable(),
+    completedSections: z.array(z.string()).default([]),
     timingSummary: z.string().nullable(),
     nextItemTitle: z.string().nullable(),
     programInput: z.number(),
@@ -193,14 +267,59 @@ export const UiScreenSpecSchema = z.object({
 export type UiScreenSpec = z.infer<typeof UiScreenSpecSchema>;
 
 /**
- * Standing UI Rule Schema (persisted across broadcasts in data/standing-rules.json
- * or scoped to the current broadcast).
+ * Mouse Context (bound when user activates UI editing and either clicks a component
+ * or draws a rectangle area on /gui/:name/:number).
+ */
+export const MouseSelectionContextSchema = z.object({
+  mode: z.enum(["none", "component", "rectangle", "area"]).default("none"),
+  pageName: z.string().default("1"),
+  viewNumber: z.number().int().positive().default(1),
+  componentId: z.string().optional(),
+  componentType: z.string().optional(),
+  panelId: z.string().optional(),
+  label: z.string().optional(),
+  rect: UiScreenRectSchema.optional(),
+  overlappingPanelIds: z.array(z.string()).optional(),
+  overlappingComponentIds: z.array(z.string()).optional(),
+  updatedAt: z.string().optional(),
+});
+export type MouseSelectionContext = z.infer<typeof MouseSelectionContextSchema>;
+
+export interface LastMessageContext {
+  prompt: string;
+  responseSummary: string;
+  targetPage: string;
+  targetView: number;
+  targetScreenId: string;
+  intent: string;
+  timestamp: string;
+}
+
+/**
+ * Saved Named UI Component (e.g. user draws a rectangle and prompts "save these as sermon controls")
+ */
+export const SavedUiComponentSchema = z.object({
+  id: z.string(),
+  name: z.string().min(1),
+  slug: z.string().min(1),
+  description: z.string().optional(),
+  panels: z.array(UiPanelNodeSchema).default([]),
+  components: z.array(UiComponentNodeSchema).default([]),
+  createdAt: z.string(),
+  sourcePage: z.string().optional(),
+  sourceView: z.number().optional(),
+});
+export type SavedUiComponent = z.infer<typeof SavedUiComponentSchema>;
+
+/**
+ * Standing UI Rule Schema
  */
 export const StandingRuleTriggerSchema = z.object({
   phase: z.enum(["preflight", "live", "post", "always"]).default("live"),
   section: z.string().nullable().optional(),
   subsection: z.string().nullable().optional(),
   cueId: z.string().nullable().optional(),
+  conditionOperator: z.enum(["during", "after", "before", "not_during", "always"]).default("during"),
   directorState: z.enum(["advising", "directing", "manual", "any"]).default("any"),
   audioClassification: z.enum(["speech", "music", "silence", "any"]).default("any"),
 });
@@ -211,7 +330,7 @@ export const StandingUiRuleCreateSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
   promptText: z.string().optional(),
-  targetScreenId: z.string().default("screen-1"),
+  targetScreenId: z.string().default("1/1"),
   targetZone: PanelZoneSchema.default("main"),
   container: z.enum(["panel", "hover"]).default("panel"),
   durability: z.enum(["persistent", "broadcast"]).default("persistent"),
