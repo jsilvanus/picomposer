@@ -31,7 +31,7 @@
   "pi": {
     "service": "picomposer",
     "displayName": "PiComposer",
-    "layer": "+1 Presentation Plane",
+    "layer": "Layer 3: Orchestration",
     "port": 3402,
     "ports": {},
     "healthEndpoint": "/health",
