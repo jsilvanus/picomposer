@@ -1,4 +1,4 @@
-const baseUrl = (process.env["PICOMPOSER_URL"] ?? "http://127.0.0.1:3460").replace(/\/+$/, "");
+const baseUrl = (process.env["PICOMPOSER_URL"] ?? "http://127.0.0.1:3402").replace(/\/+$/, "");
 
 async function request(path: string, method = "GET", body?: unknown): Promise<any> {
   const res = await fetch(`${baseUrl}${path}`, {

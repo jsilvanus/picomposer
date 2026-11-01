@@ -32,7 +32,7 @@
     "service": "picomposer",
     "displayName": "PiComposer",
     "layer": "+1 Presentation Plane",
-    "port": 3460,
+    "port": 3402,
     "ports": {},
     "healthEndpoint": "/health",
     "envPortVar": "PICOMPOSER_PORT"
