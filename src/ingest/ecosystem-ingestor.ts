@@ -147,6 +147,14 @@ export class EcosystemIngestor {
         break;
       }
 
+      case "transcript": {
+        if (typeof data?.["text"] === "string" && data["text"]) {
+          this.state.ingestTranscript(data["text"], data["timestamp"]);
+          this.reactiveAgent.composeAll("transcript_updated");
+        }
+        break;
+      }
+
       case "pivoice":
       case "pisound": {
         this.state.updateHardware({

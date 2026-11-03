@@ -11,6 +11,7 @@ export interface ComposerConfig {
   pitubeUrl: string;
   standingRulesFile: string;
   autoConnectSse: boolean;
+  pigatewayApiKey: string | undefined;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ComposerConfig {
@@ -29,7 +30,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ComposerConfig
 
   const standingRulesFile =
     env["PICOMPOSER_RULES_FILE"]?.trim() || "data/standing-rules.json";
-  const autoConnectSse = env["PICOMPOSER_AUTO_SSE"] === "true";
+  const autoConnectSse = env["PICOMPOSER_AUTO_SSE"] !== "false";
 
   return {
     host,
@@ -44,5 +45,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ComposerConfig
     pitubeUrl,
     standingRulesFile,
     autoConnectSse,
+    pigatewayApiKey: env["PIGATEWAY_API_KEY"]?.trim() || undefined,
   };
 }
