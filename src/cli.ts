@@ -1,8 +1,4 @@
-import fs from "node:fs/promises";
-import { assertLocalTarget, runLive, runOffline } from "./sim/player.js";
-import { parseScenario } from "./sim/scenario.js";
-
-const baseUrl = (process.env["PICOMPOSER_URL"] ?? "http://127.0.0.1:3460").replace(/\/+$/, "");
+const baseUrl = (process.env["PICOMPOSER_URL"] ?? "http://127.0.0.1:3402").replace(/\/+$/, "");
 
 async function request(path: string, method = "GET", body?: unknown): Promise<any> {
   const res = await fetch(`${baseUrl}${path}`, {
@@ -70,26 +66,6 @@ async function run(): Promise<void> {
       break;
     }
 
-    case "sim": {
-      const live = args.includes("--live");
-      const outIdx = args.indexOf("--out");
-      const outDir = outIdx >= 0 ? args[outIdx + 1]! : "sim-out";
-      const file = args.find((a, i) => !a.startsWith("--") && args[i - 1] !== "--out");
-      if (!file) {
-        console.error("Usage: picomposer sim <scenario.jsonl> [--out <dir>] [--live]");
-        process.exit(1);
-      }
-      const steps = parseScenario(await fs.readFile(file, "utf8"));
-      if (live) {
-        assertLocalTarget(baseUrl);
-        await runLive(steps, baseUrl);
-      } else {
-        const res = await runOffline(steps, outDir);
-        console.log(`${res.steps} steps -> ${res.outDir}/index.html`);
-      }
-      break;
-    }
-
     default: {
       console.log(`picomposer CLI — Agentic Generative UI & Multi-Screen Composer (${baseUrl})
 
@@ -99,7 +75,6 @@ Commands:
   picomposer screens                                 List all screen slots (screen-1/copilot, screen-2/operator, screen-3/preflight)
   picomposer screen [screenId]                       Inspect typed JSON UiScreenSpec for a screen
   picomposer prompt [--screen <id>] "<prompt>"       Prompt the UI Creator Agent (e.g. "Add graphics buttons here during sermon")
-  picomposer sim <file.jsonl> [--out dir] [--live]   Play a scenario: HTML snapshots per step (offline) or timed events to a local server
   picomposer rules                                   List persistent & broadcast-scoped standing UI rules`);
       break;
     }

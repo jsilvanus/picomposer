@@ -1,6 +1,10 @@
 {
   "name": "picomposer",
   "version": "0.1.0",
+  "packageManager": "pnpm@11.23.0",
+  "engines": {
+    "node": ">=22"
+  },
   "description": "Agentic Generative UI & Multi-Screen Workspace Composer for the Pi Broadcast Ecosystem",
   "type": "module",
   "main": "dist/index.js",
@@ -20,8 +24,17 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
-    "@types/node": "^22.13.4",
-    "tsx": "^4.19.2",
-    "typescript": "^5.7.3"
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.9.0"
+  },
+  "pi": {
+    "service": "picomposer",
+    "displayName": "PiComposer",
+    "layer": "Layer 3: Orchestration",
+    "port": 3402,
+    "ports": {},
+    "healthEndpoint": "/health",
+    "envPortVar": "PICOMPOSER_PORT"
   }
 }

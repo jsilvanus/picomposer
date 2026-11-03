@@ -1,7 +1,0 @@
-# Hardware trouble: ATEM drops out and returns, voice activity changes, broadcast dumped.
-{"at":0,"label":"ATEM connected","event":"atem","data":{"connected":true,"programInput":1,"previewInput":2}}
-{"at":2000,"label":"ATEM lost","event":"atem","data":{"connected":false}}
-{"at":5000,"label":"ATEM back","event":"atem","data":{"connected":true,"programInput":1,"previewInput":2}}
-{"at":7000,"label":"Speech starts","event":"pivoice","data":{"voiceActive":true,"classification":"speech"}}
-{"at":10000,"label":"Music","event":"pivoice","data":{"voiceActive":false,"classification":"music"}}
-{"at":12000,"label":"Broadcast dumped","event":"broadcast-dumped","data":{}}
