@@ -1,0 +1,6 @@
+# Autonomous mode, then the operator preempts and later hands back.
+{"at":0,"label":"Autonomous","event":"mode-changed","data":{"mode":"autonomous","previousMode":"advisory"}}
+{"at":3000,"label":"Auto cut to input 3","event":"executed","data":{"decision":{"cutToInput":3}}}
+{"at":6000,"label":"Operator preempts","event":"preempted","data":{"actor":"operator","newMode":"manual","previousMode":"autonomous","reason":"Wrong shot"}}
+{"at":9000,"label":"Manual cut to input 1","event":"action","data":{"actor":"operator","action":"cut","params":{"input":1}}}
+{"at":12000,"label":"Continue AI","event":"mode-changed","data":{"mode":"autonomous","previousMode":"manual"}}

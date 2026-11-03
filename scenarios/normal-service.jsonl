@@ -1,0 +1,8 @@
+# Normal service: broadcast goes live, director advises, shot is taken, rundown moves on.
+{"at":0,"label":"Broadcast live","event":"pitube","data":{"state":"live"}}
+{"at":1000,"label":"Rundown: opening hymn","event":"rundown","data":{"currentSection":"Opening hymn"}}
+{"at":3000,"label":"Director advises camera 2","event":"advisory","data":{"id":"a1","cutToInput":2,"reason":"Preacher steps to the lectern"}}
+{"at":8000,"label":"Cut executed","event":"executed","data":{"decision":{"cutToInput":2}}}
+{"at":9000,"label":"Rundown: sermon","event":"rundown","data":{"currentSection":"Sermon"}}
+{"at":12000,"label":"Operator asks for PTZ pad","prompt":"Give me Camera 2 PTZ controls on screen-2","screen":"screen-2"}
+{"at":20000,"label":"Broadcast complete","event":"pitube","data":{"state":"complete"}}

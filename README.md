@@ -32,3 +32,21 @@ On-demand workspace builder and standing-rule author prompted by the operator (`
 - `screen-2` (aliases: `operator`, `workspace`, `custom`): Prompted Operator Workspace
 - `screen-3` (aliases: `preflight`, `setup`): Setup, Preflight & Rundown Overview
 - Any ad-hoc screen ID (e.g. `/api/v1/screens/tablet-cam2`) is automatically registered on demand.
+
+
+---
+
+## Simulation (no hardware)
+
+`picomposer sim` replays a scenario: a JSONL file of timed events (the same types as `POST /api/v1/ingest/event`) and operator prompts.
+
+```bash
+# Offline: runs in-process, no network, no LLM (the prompt agent uses its deterministic compiler).
+# Writes sim-out/index.html plus one HTML snapshot of screen-1/2/3 after every step.
+npm run cli -- sim scenarios/normal-service.jsonl --out sim-out
+
+# Live: replays with real timing against a running picomposer (local hosts only); watch /gui/1.
+npm run cli -- sim scenarios/operator-takes-over.jsonl --live
+```
+
+Step format: `{"at":5000,"label":"...","event":"advisory","data":{...}}` or `{"at":9000,"prompt":"...","screen":"screen-2"}`. `at` (ms) only matters with `--live`. Samples in `scenarios/`: `normal-service`, `operator-takes-over`, `failures`. Offline runs never contact pidirector, pigateway, pirundown, pitube or Ollama.
