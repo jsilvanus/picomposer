@@ -15,6 +15,7 @@ import {
   type UiVisibilityCondition,
 } from "../schema/ui-schema.js";
 import type { BroadcastContextState, ComposerState } from "../state/composer-state.js";
+import { normalizeKeepAlive } from "../config.js";
 import type { ContextReactiveUiAgent } from "./context-reactive-agent.js";
 
 export interface PromptedCreatorAgentOptions {
@@ -24,6 +25,7 @@ export interface PromptedCreatorAgentOptions {
   ollamaUrl: string;
   model: string;
   timeoutMs?: number | undefined;
+  keepAlive?: string | number | undefined;
   fetchFn?: typeof fetch | undefined;
   eventBroker?: ComposerEventBroker | undefined;
 }
@@ -222,6 +224,7 @@ export class PromptedUiCreatorAgent {
   private readonly ollamaUrl: string;
   private readonly model: string;
   private readonly timeoutMs: number;
+  private readonly keepAlive: string | number;
   private readonly fetchFn: typeof fetch;
   private readonly eventBroker?: ComposerEventBroker | undefined;
 
@@ -232,6 +235,7 @@ export class PromptedUiCreatorAgent {
     this.ollamaUrl = options.ollamaUrl.replace(/\/+$/, "");
     this.model = options.model;
     this.timeoutMs = options.timeoutMs ?? 1500;
+    this.keepAlive = normalizeKeepAlive(options.keepAlive);
     this.fetchFn = options.fetchFn ?? globalThis.fetch;
     this.eventBroker = options.eventBroker;
   }
@@ -1344,6 +1348,7 @@ Respond ONLY with valid JSON:
           model: this.model,
           stream: false,
           format: "json",
+          keep_alive: this.keepAlive,
           messages: [
             { role: "system", content: system },
             {

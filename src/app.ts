@@ -53,6 +53,7 @@ export function buildApp(
     ollamaUrl: config.ollamaUrl,
     model: config.creatorModel,
     timeoutMs: config.ollamaTimeoutMs,
+    keepAlive: config.ollamaKeepAlive,
     fetchFn: options?.fetchFn,
     eventBroker,
   });

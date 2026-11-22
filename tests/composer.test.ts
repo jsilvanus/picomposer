@@ -651,3 +651,32 @@ test("Generative UI: Action targets on primitives, sent captions feed, UI-cues w
 
   await app.close();
 });
+
+
+test("Ollama keep_alive: default 15m, configurable, sent with the creator agent's chat request", async (t) => {
+  assert.equal(loadConfig({}).ollamaKeepAlive, "15m");
+  assert.equal(loadConfig({ PICOMPOSER_OLLAMA_KEEP_ALIVE: "1h" }).ollamaKeepAlive, "1h");
+  assert.equal(loadConfig({ OLLAMA_KEEP_ALIVE: "-1" }).ollamaKeepAlive, -1);
+
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "picomposer-test-"));
+  t.after(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+  const seen: unknown[] = [];
+  const mockFetch: typeof fetch = async (input, init) => {
+    if (String(input).endsWith("/api/chat")) {
+      seen.push(JSON.parse(String(init?.body ?? "{}")).keep_alive);
+    }
+    return new Response("{}", { status: 500 });
+  };
+  const config = loadConfig({ PICOMPOSER_RULES_FILE: path.join(tmpDir, "rules.json") });
+  const { app } = buildApp(config, { fetchFn: mockFetch });
+  await app.ready();
+  await app.inject({
+    method: "POST",
+    url: "/api/v1/prompt",
+    payload: { prompt: "zxqv wibble frobnicate the quux", targetScreenId: "screen-1" },
+  });
+  assert.ok(seen.length > 0, "the prompt should have reached Ollama");
+  assert.ok(seen.every((k) => k === "15m"));
+});
